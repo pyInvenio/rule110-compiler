@@ -24,6 +24,9 @@ public:
     // Evolve a single generation using 64-bit bitwise ops
     static State next_generation(const State& current_state);
 
+    // In-place: write next generation of src into dst (must be same size, pre-allocated)
+    static void next_generation(const State& src, State& dst);
+
     // Check if the halt pattern (01101001101000) exists in a region of the tape
     static bool check_halt(const State& current_state, size_t start_bit, size_t end_bit);
     static bool check_halt(const State& current_state); // full tape

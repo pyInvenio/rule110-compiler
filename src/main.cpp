@@ -164,68 +164,106 @@ int main(int argc, char* argv[]) {
     std::cout << "Tail buffer: " << tail_save << " rows ("
               << view_width * tail_save / (1024 * 1024) << " MB)\n";
 
-    // Stream head to disk
-    std::ofstream head_pgm(outdir + "/head.pgm", std::ios::binary);
-    head_pgm << "P5\n" << view_width << " " << (HEAD_GENS + 1) << "\n255\n";
-    std::vector<uint8_t> row_buf;
-    extract_row(state, view_start, view_width, row_buf);
-    write_pgm_row(head_pgm, row_buf, view_width);
-    bool head_done = false;
+    // Double-buffer: two pre-allocated states, swap instead of allocating
+    Rule110Runner::State buf_b(state.size());
+    Rule110Runner::State* cur = &state;
+    Rule110Runner::State* nxt = &buf_b;
 
-    std::deque<std::vector<uint8_t>> tail_rows;
-    tail_rows.push_back(row_buf);
-
-    Rule110Runner::State prev30 = state;
+    Rule110Runner::State prev30 = *cur;
     long long halt_gen = -1, current_gen = 0;
 
     std::signal(SIGINT, signal_handler);
     std::cout << "\nRunning (Ctrl+C to stop)...\n\n";
 
-    for (long long g = 1; ; g++) {
-        if (interrupted.load()) {
-            std::cout << "\n  Interrupted at gen " << current_gen << "\n";
-            break;
-        }
+    {
+        std::ofstream head_pgm(outdir + "/head.pgm", std::ios::binary);
+        head_pgm << "P5\n" << view_width << " " << (HEAD_GENS + 1) << "\n255\n";
+        std::vector<uint8_t> row_buf;
+        extract_row(*cur, view_start, view_width, row_buf);
+        write_pgm_row(head_pgm, row_buf, view_width);
 
-        state = Rule110Runner::next_generation(state);
-        current_gen = g;
-        extract_row(state, view_start, view_width, row_buf);
-
-        if (!head_done) {
+        for (long long g = 1; g <= HEAD_GENS && !interrupted.load(); g++) {
+            Rule110Runner::next_generation(*cur, *nxt);
+            std::swap(cur, nxt);
+            current_gen = g;
+            extract_row(*cur, view_start, view_width, row_buf);
             write_pgm_row(head_pgm, row_buf, view_width);
-            if (g == HEAD_GENS) {
-                head_pgm.close();
-                head_done = true;
-                std::cout << "  Saved head.pgm\n";
+
+            if (g % 30 == 0) {
+                int mm = count_unsettled(*cur, prev30, center_start, center_end);
+                prev30 = *cur;
+                if (mm < 300) {
+                    halt_gen = g;
+                    std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
+                    break;
+                }
             }
         }
+        head_pgm.close();
+        std::cout << "  Saved head.pgm (" << current_gen << " gens)\n";
+    }
 
-        tail_rows.push_back(row_buf);
-        if ((int)tail_rows.size() > tail_save)
-            tail_rows.pop_front();
+    // Save a checkpoint every tail_save gens so we can re-run for tail image.
+    Rule110Runner::State checkpoint = *cur;
+    long long checkpoint_gen = current_gen;
 
-        if (g % 30 == 0) {
-            int mm = count_unsettled(state, prev30, center_start, center_end);
-            prev30 = state;
-            if (mm < 300) {
-                halt_gen = g;
-                std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
+    if (halt_gen < 0 && !interrupted.load()) {
+        for (long long g = current_gen + 1; ; g++) {
+            if (interrupted.load()) {
+                current_gen = g - 1;
+                std::cout << "\n  Interrupted at gen " << current_gen << "\n";
                 break;
             }
-            if (g % 10000 == 0)
-                std::cout << "  gen " << g << "  mm=" << mm << "\n";
-        } else if (g % 10000 == 0) {
-            std::cout << "  gen " << g << "\n";
+
+            Rule110Runner::next_generation(*cur, *nxt);
+            std::swap(cur, nxt);
+            current_gen = g;
+
+            // Checkpoint for tail image
+            if (g % tail_save == 0) {
+                checkpoint = *cur;
+                checkpoint_gen = g;
+            }
+
+            if (g % 30 == 0) {
+                int mm = count_unsettled(*cur, prev30, center_start, center_end);
+                prev30 = *cur;
+                if (mm < 300) {
+                    halt_gen = g;
+                    std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
+                    break;
+                }
+                if (g % 10000 == 0)
+                    std::cout << "  gen " << g << "  mm=" << mm << "\n";
+            } else if (g % 10000 == 0) {
+                std::cout << "  gen " << g << "\n";
+            }
         }
     }
 
-    if (!head_done) head_pgm.close();
+    {
+        std::deque<std::vector<uint8_t>> tail_rows;
+        std::vector<uint8_t> row_buf;
 
-    long long tail_start = current_gen - (long long)tail_rows.size() + 1;
-    write_pgm(outdir + "/tail.pgm", tail_rows, view_width);
-    std::cout << "  Saved tail.pgm (" << tail_rows.size() << " rows, gen "
-              << tail_start << "-" << current_gen << ")\n";
-    tail_rows.clear();
+        // Start from checkpoint, re-run to current_gen
+        Rule110Runner::State replay = checkpoint;
+        long long replay_start = checkpoint_gen;
+
+        // Only need the last tail_save rows, but checkpoint might be further back
+        for (long long g = replay_start; g <= current_gen; g++) {
+            if (g > replay_start)
+                replay = Rule110Runner::next_generation(replay);
+            extract_row(replay, view_start, view_width, row_buf);
+            tail_rows.push_back(row_buf);
+            if ((int)tail_rows.size() > tail_save)
+                tail_rows.pop_front();
+        }
+
+        long long tail_start = current_gen - (long long)tail_rows.size() + 1;
+        write_pgm(outdir + "/tail.pgm", tail_rows, view_width);
+        std::cout << "  Saved tail.pgm (" << tail_rows.size() << " rows, gen "
+                  << tail_start << "-" << current_gen << ")\n";
+    }
 
     // Verification
     std::ofstream sf(outdir + "/summary.txt");
@@ -247,7 +285,7 @@ int main(int argc, char* argv[]) {
     out("  R110 settled: " + std::string(halt_gen >= 0 ? "PASS" : "FAIL"));
 
     if (halt_gen >= 0) {
-        auto s1 = Rule110Runner::next_generation(state);
+        auto s1 = Rule110Runner::next_generation(*cur);
         size_t ck_start = 1000;
         size_t ck_end = std::min(center_start - 1000, ck_start + 100000);
         int emm = check_ether(state, s1, ck_start, ck_end);
