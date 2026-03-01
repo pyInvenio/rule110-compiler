@@ -3,6 +3,7 @@
 #include "TagToCyclic.hpp"
 #include "Rule110Compiler.hpp"
 #include "Rule110Runner.hpp"
+#include "HashLife1D.hpp"
 #include "Verifier.hpp"
 #include <iostream>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <sys/stat.h>
 #include <csignal>
 #include <atomic>
+#include <chrono>
 
 using namespace Rule110;
 
@@ -203,27 +205,145 @@ int main(int argc, char* argv[]) {
         std::cout << "  Saved head.pgm (" << current_gen << " gens)\n";
     }
 
-    // Save a checkpoint every tail_save gens so we can re-run for tail image.
-    Rule110Runner::State checkpoint = *cur;
-    long long checkpoint_gen = current_gen;
-
     if (halt_gen < 0 && !interrupted.load()) {
-        for (long long g = current_gen + 1; ; g++) {
-            if (interrupted.load()) {
-                current_gen = g - 1;
-                std::cout << "\n  Interrupted at gen " << current_gen << "\n";
+        auto t0 = std::chrono::steady_clock::now();
+
+        // Extract ether pattern (period 14) from left_periodic
+        std::vector<int> ether_pat(r110.left_periodic.begin(),
+                                    r110.left_periodic.begin() + std::min((size_t)14, r110.left_periodic.size()));
+
+        // Convert flat state to individual bits for hashlife
+        size_t tape_size = state.size() * 64;
+        std::vector<int> flat_tape(tape_size);
+        for (size_t i = 0; i < tape_size; i++)
+            flat_tape[i] = get_bit(*cur, i);
+
+        HashLife1D hl;
+        HashLife1D::Node* root = hl.from_bits(flat_tape, ether_pat);
+        std::vector<int>().swap(flat_tape);  // free memory
+
+        std::cout << "  HashLife: " << hl.node_count() << " nodes, "
+                  << hl.canon_size() << " canonical\n";
+
+        // Settling check: extract center region to flat buffer, then compare
+        size_t settle_start = center_start;
+        size_t settle_len = center_end - center_start + 720;
+        std::vector<uint8_t> buf_curr, buf_prev;
+
+        auto hl_settling_check = [&](HashLife1D::Node* curr_root,
+                                      HashLife1D::Node* prev_root) -> int {
+            hl.extract_bits(curr_root, settle_start, settle_len, buf_curr);
+            hl.extract_bits(prev_root, settle_start, settle_len, buf_prev);
+            int mm = 0;
+            for (size_t i = 720; i < settle_len; i++) {
+                if (buf_curr[i] != buf_prev[i - 720])
+                    mm++;
+            }
+            return mm;
+        };
+
+        // Exponential settling search
+        long long step_size = 30;
+        long long search_gen = current_gen;
+        HashLife1D::Node* last_unsettled_root = root;
+        long long last_unsettled_gen = current_gen;
+
+        while (!interrupted.load()) {
+            HashLife1D::Node* prev30_root = root;
+            root = hl.advance(root, step_size);
+            search_gen += step_size;
+
+            // Advance prev30 to (search_gen - 30)
+            HashLife1D::Node* prev_check = (step_size > 30)
+                ? hl.advance(prev30_root, step_size - 30)
+                : prev30_root;
+
+            if (interrupted.load()) break;
+
+            int mm = hl_settling_check(root, prev_check);
+
+            if (interrupted.load()) break;
+
+            if (mm < 300) {
+                halt_gen = search_gen;
+                std::cout << "  SETTLED gen " << search_gen << " (mm=" << mm
+                          << ", step=" << step_size << ")\n";
                 break;
             }
 
+            last_unsettled_root = root;
+            last_unsettled_gen = search_gen;
+            step_size = std::min(step_size * 2, (long long)(1 << 20));
+
+            std::cout << "  gen " << search_gen << "  mm=" << mm
+                      << "  step=" << step_size
+                      << "  nodes=" << hl.node_count() << "\n";
+        }
+
+        // Binary search to narrow the bracket
+        if (halt_gen >= 0 && halt_gen - last_unsettled_gen > tail_save) {
+            std::cout << "  Binary search: [" << last_unsettled_gen
+                      << ", " << halt_gen << "]\n";
+            long long lo = last_unsettled_gen, hi = halt_gen;
+            HashLife1D::Node* base_root = last_unsettled_root;
+
+            while (hi - lo > tail_save && !interrupted.load()) {
+                long long mid = lo + (hi - lo) / 2;
+                mid = (mid / 30) * 30;
+                if (mid <= lo) mid = lo + 30;
+                if (mid >= hi) break;
+
+                HashLife1D::Node* mid_root = hl.advance(base_root, mid - lo);
+                HashLife1D::Node* prev_root = hl.advance(base_root, mid - lo - 30);
+
+                int mm = hl_settling_check(mid_root, prev_root);
+
+                if (mm < 300) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                    base_root = mid_root;
+                }
+            }
+            last_unsettled_root = base_root;
+            last_unsettled_gen = lo;
+            std::cout << "  Narrowed to [" << lo << ", " << hi << "]\n";
+        }
+
+        // Convert hashlife state back to flat for tail phase
+        auto flat_final = hl.to_packed_state(last_unsettled_root, tape_size);
+        *cur = std::move(flat_final);
+        current_gen = last_unsettled_gen;
+
+        auto t1 = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(t1 - t0).count();
+        std::cout << "  HashLife phase: " << secs << "s, "
+                  << hl.node_count() << " nodes\n";
+
+        // Brute-force from narrowed bracket to find exact settling gen + tail rows
+        buf_b.resize(cur->size());
+        nxt = &buf_b;
+        prev30 = *cur;
+        halt_gen = -1;
+    }
+
+    {
+        std::deque<std::vector<uint8_t>> tail_rows;
+        std::vector<uint8_t> row_buf;
+
+        // Record current row
+        extract_row(*cur, view_start, view_width, row_buf);
+        tail_rows.push_back(row_buf);
+
+        for (long long g = current_gen + 1; !interrupted.load(); g++) {
             Rule110Runner::next_generation(*cur, *nxt);
             std::swap(cur, nxt);
             current_gen = g;
 
-            // Checkpoint for tail image
-            if (g % tail_save == 0) {
-                checkpoint = *cur;
-                checkpoint_gen = g;
-            }
+            extract_row(*cur, view_start, view_width, row_buf);
+            tail_rows.push_back(row_buf);
+            if ((int)tail_rows.size() > tail_save)
+                tail_rows.pop_front();
 
             if (g % 30 == 0) {
                 int mm = count_unsettled(*cur, prev30, center_start, center_end);
@@ -233,30 +353,7 @@ int main(int argc, char* argv[]) {
                     std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
                     break;
                 }
-                if (g % 10000 == 0)
-                    std::cout << "  gen " << g << "  mm=" << mm << "\n";
-            } else if (g % 10000 == 0) {
-                std::cout << "  gen " << g << "\n";
             }
-        }
-    }
-
-    {
-        std::deque<std::vector<uint8_t>> tail_rows;
-        std::vector<uint8_t> row_buf;
-
-        // Start from checkpoint, re-run to current_gen
-        Rule110Runner::State replay = checkpoint;
-        long long replay_start = checkpoint_gen;
-
-        // Only need the last tail_save rows, but checkpoint might be further back
-        for (long long g = replay_start; g <= current_gen; g++) {
-            if (g > replay_start)
-                replay = Rule110Runner::next_generation(replay);
-            extract_row(replay, view_start, view_width, row_buf);
-            tail_rows.push_back(row_buf);
-            if ((int)tail_rows.size() > tail_save)
-                tail_rows.pop_front();
         }
 
         long long tail_start = current_gen - (long long)tail_rows.size() + 1;
@@ -288,7 +385,7 @@ int main(int argc, char* argv[]) {
         auto s1 = Rule110Runner::next_generation(*cur);
         size_t ck_start = 1000;
         size_t ck_end = std::min(center_start - 1000, ck_start + 100000);
-        int emm = check_ether(state, s1, ck_start, ck_end);
+        int emm = check_ether(*cur, s1, ck_start, ck_end);
         out("  Left ether: " + std::to_string(emm) + "/" + std::to_string(ck_end - ck_start)
             + " " + (emm == 0 ? "PASS" : "FAIL"));
         if (emm != 0) pass = false;
