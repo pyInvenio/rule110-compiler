@@ -7,14 +7,23 @@ static void emit(std::vector<int>& out, const std::vector<int>& bits) {
     out.insert(out.end(), bits.begin(), bits.end());
 }
 
-static void emit_repeat(std::vector<int>& out, const std::vector<int>& bits, int count) {
-    for (int i = 0; i < count; i++)
-        out.insert(out.end(), bits.begin(), bits.end());
+static void emit_map(std::vector<char>& map, char block, size_t count) {
+    map.insert(map.end(), count, block);
 }
 
-static void emit_block(std::vector<int>& out, int& phase, char block) {
+static void emit_repeat(std::vector<int>& out, std::vector<char>& map,
+                         const std::vector<int>& bits, char block, int count) {
+    for (int i = 0; i < count; i++)
+        out.insert(out.end(), bits.begin(), bits.end());
+    emit_map(map, block, bits.size() * count);
+}
+
+static void emit_block(std::vector<int>& out, std::vector<char>& map,
+                        int& phase, char block) {
     phase = BlockData::next_phase(phase, block);
-    emit(out, BlockData::get_block_row(block, phase));
+    auto row = BlockData::get_block_row(block, phase);
+    emit(out, row);
+    emit_map(map, block, row.size());
 }
 
 // Y->II, N->IJ, first I->KH, empty->L. Move first K to end.
@@ -57,7 +66,8 @@ static void count_appendant_stats(const CyclicTagSystem::Appendants& appendants,
 // Left periodic: A^v B A^13 B A^11 B A^12 B (spatial left to right)
 // Phase tracking from C outward (right to left), then emit in reverse.
 // B uses incoming phase; phase change applies to subsequent A blocks.
-static std::vector<int> build_left_periodic(const CyclicTagSystem::Appendants& appendants) {
+static void build_left_periodic(const CyclicTagSystem::Appendants& appendants,
+                                 std::vector<int>& bits, std::vector<char>& map) {
     int ys, ns, nonempty, empty;
     count_appendant_stats(appendants, ys, ns, nonempty, empty);
     long long v = 76LL * ys + 80LL * ns + 60LL * nonempty + 43LL * empty;
@@ -77,12 +87,11 @@ static std::vector<int> build_left_periodic(const CyclicTagSystem::Appendants& a
     for (const auto& s : segs)
         total += BlockData::get_block_row(s.block, s.phase).size() * s.count;
 
-    std::vector<int> bits;
     bits.reserve(total);
+    map.reserve(total);
     for (int i = (int)segs.size() - 1; i >= 0; i--)
-        emit_repeat(bits, BlockData::get_block_row(segs[i].block, segs[i].phase), segs[i].count);
-
-    return bits;
+        emit_repeat(bits, map, BlockData::get_block_row(segs[i].block, segs[i].phase),
+                    segs[i].block, segs[i].count);
 }
 
 Rule110State Rule110Compiler::compile(const CyclicTagSystem& cts) {
@@ -91,23 +100,27 @@ Rule110State Rule110Compiler::compile(const CyclicTagSystem& cts) {
     const auto& appendants = cts.get_appendants();
 
     int phase = BlockData::INITIAL_PHASE;
-    emit(state.central_part, BlockData::block_C(BlockData::ZERO_LOC));
+    auto c_row = BlockData::block_C(BlockData::ZERO_LOC);
+    emit(state.central_part, c_row);
+    emit_map(state.central_block_map, 'C', c_row.size());
 
     if (!tape.empty()) {
         for (int i = 0; i < (int)tape.size() - 1; i++) {
-            emit_block(state.central_part, phase, tape[i] == 0 ? 'E' : 'F');
-            emit_block(state.central_part, phase, 'D');
+            emit_block(state.central_part, state.central_block_map, phase,
+                       tape[i] == 0 ? 'E' : 'F');
+            emit_block(state.central_part, state.central_block_map, phase, 'D');
         }
-        emit_block(state.central_part, phase, tape.back() == 0 ? 'E' : 'F');
-        emit_block(state.central_part, phase, 'G');
+        emit_block(state.central_part, state.central_block_map, phase,
+                   tape.back() == 0 ? 'E' : 'F');
+        emit_block(state.central_part, state.central_block_map, phase, 'G');
     }
 
     auto right_seq = build_right_sequence(appendants);
     int right_phase = phase;
     for (char block : right_seq)
-        emit_block(state.right_periodic, right_phase, block);
+        emit_block(state.right_periodic, state.right_block_map, right_phase, block);
 
-    state.left_periodic = build_left_periodic(appendants);
+    build_left_periodic(appendants, state.left_periodic, state.left_block_map);
 
     return state;
 }

@@ -204,6 +204,13 @@ std::vector<TMTestCase> Verifier::get_tm_tests() {
         {"Unary increment", 2, 2,
             {{0, 0, 0, 1, Move::HALT}, {0, 1, 0, 1, Move::RIGHT}},
             0, {1, 1, 0}, 0, {1, 1, 1}, 2},
+        {"Binary addition (7+3)", 2, 5,
+            {{0, 1, 0, 1, Move::RIGHT}, {0, 2, 0, 2, Move::RIGHT},
+             {0, 3, 0, 4, Move::RIGHT}, {0, 4, 1, 3, Move::RIGHT},
+             {1, 0, 0, 2, Move::HALT},
+             {1, 1, 0, 2, Move::RIGHT}, {1, 2, 1, 1, Move::RIGHT},
+             {1, 3, 1, 3, Move::RIGHT}, {1, 4, 1, 4, Move::RIGHT}},
+            0, {4, 4, 3}, 0, {3, 4, 3, 2}, 3},
     };
 }
 
