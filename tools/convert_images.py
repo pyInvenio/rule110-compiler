@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert all PGM files in a run output directory to PNG with crops."""
+"""Convert all PGM/PPM files in a run output directory to PNG with crops."""
 
 import argparse
 import sys
@@ -17,7 +17,7 @@ CROP_WIDTH = 5000  # pixels for edge crops
 CENTER_WIDTH = 4000  # pixels for center crop
 
 
-def convert_pgm(pgm_path: Path, outdir: Path):
+def convert_image(pgm_path: Path, outdir: Path):
     img = Image.open(pgm_path)
     w, h = img.size
     stem = pgm_path.stem
@@ -66,7 +66,7 @@ def convert_pgm(pgm_path: Path, outdir: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert R110 output PGMs to PNG")
+    parser = argparse.ArgumentParser(description="Convert R110 output PGM/PPM to PNG")
     parser.add_argument("dir", help="Output directory containing PGM files")
     args = parser.parse_args()
 
@@ -75,14 +75,14 @@ def main():
         print(f"Not a directory: {d}")
         sys.exit(1)
 
-    pgms = sorted(d.glob("*.pgm"))
-    if not pgms:
-        print(f"No PGM files in {d}")
+    images = sorted(list(d.glob("*.pgm")) + list(d.glob("*.ppm")))
+    if not images:
+        print(f"No PGM/PPM files in {d}")
         sys.exit(1)
 
-    print(f"Processing {len(pgms)} PGM file(s) in {d}")
-    for pgm in pgms:
-        convert_pgm(pgm, d)
+    print(f"Processing {len(images)} image file(s) in {d}")
+    for img_path in images:
+        convert_image(img_path, d)
 
     print(f"\nDone. All images saved to {d}/")
 
