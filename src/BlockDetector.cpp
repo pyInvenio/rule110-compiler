@@ -68,7 +68,7 @@ std::vector<char> BlockDetector::assign_colors(
             colors[j] = tracked;
     }
 
-    // Color gap cells
+    // Color gap cells with phase-aware width cap
     for (size_t ci = 0; ci + 1 < clusters.size(); ci++) {
         if (ci >= gaps_.size() || gaps_[ci].type == 'A') continue;
 
@@ -77,27 +77,16 @@ std::vector<char> BlockDetector::assign_colors(
         if (gap_start >= gap_end) continue;
 
         char color = gaps_[ci].type;
-        bool tiled = (color >= 'H' && color <= 'L') || color == 'B';
+        int phase = (gaps_[ci].initial_phase + generation_) % 30;
+        size_t expected = BlockData::get_block_row(color, phase).size();
+        size_t half = expected / 2;
 
-        if (tiled) {
-            // Right periodic (H-L) and left periodic (B) blocks tile
-            // with no ether gaps — paint the entire gap
-            for (size_t j = gap_start; j < gap_end; j++)
+        for (size_t j = gap_start; j < gap_end; j++) {
+            size_t dl = j - gap_start;
+            size_t dr = gap_end - 1 - j;
+            size_t dist = std::min(dl, dr);
+            if (dist < half)
                 colors[j] = color;
-        } else {
-            // Central blocks (C-G): phase-aware width cap to avoid
-            // painting ether as block interior
-            int phase = (gaps_[ci].initial_phase + generation_) % 30;
-            size_t expected = BlockData::get_block_row(color, phase).size();
-            size_t half = expected / 2;
-
-            for (size_t j = gap_start; j < gap_end; j++) {
-                size_t dl = j - gap_start;
-                size_t dr = gap_end - 1 - j;
-                size_t dist = std::min(dl, dr);
-                if (dist < half)
-                    colors[j] = color;
-            }
         }
     }
 
@@ -200,8 +189,14 @@ void BlockDetector::init(const std::vector<uint8_t>& row,
         if (map_pos < block_map.size()) {
             char b = block_map[map_pos];
             if (b != 'A' && b != 'B') {
-                gap_type = b;
-                gap_phase = phase_at[map_pos];
+                // Tiled blocks (H-L) have no ether gaps — skip gap fill
+                // to keep thin diagonal traces like central region
+                bool tiled = (b == 'H' || b == 'I' || b == 'J' ||
+                              b == 'K' || b == 'L');
+                if (!tiled) {
+                    gap_type = b;
+                    gap_phase = phase_at[map_pos];
+                }
             }
         }
         gaps_.push_back({gap_type, gap_phase});
@@ -346,15 +341,19 @@ std::vector<char> BlockDetector::advance(const std::vector<uint8_t>& row, size_t
         }
     }
 
-    // Override types for clusters in tiled regions (right/left periodic)
-    // block_map is ground truth — prevents central E-type contamination
+    // Override clusters in tiled regions to prevent central type contamination
     if (!block_map_.empty()) {
         for (auto& cl : new_clusters) {
             if (cl.center < block_map_.size()) {
-                char b = block_map_[cl.center];
-                if ((b >= 'H' && b <= 'L') || b == 'B') {
-                    cl.left_block = b;
-                    cl.right_block = b;
+                char bm = block_map_[cl.center];
+                bool bm_tiled = (bm == 'H' || bm == 'I' || bm == 'J' ||
+                                 bm == 'K' || bm == 'L');
+                bool cl_tiled = (cl.left_block == 'H' || cl.left_block == 'I' ||
+                                 cl.left_block == 'J' || cl.left_block == 'K' ||
+                                 cl.left_block == 'L');
+                if (bm_tiled && !cl_tiled) {
+                    cl.left_block = bm;
+                    cl.right_block = bm;
                 }
             }
         }

@@ -41,12 +41,17 @@ struct RGB { uint8_t r, g, b; };
 static RGB block_color(char block, bool on) {
     switch (block) {
         case 'A': return on ? RGB{100,100,100} : RGB{220,220,220};
-        case 'B': return on ? RGB{80,80,120}   : RGB{200,200,230};
+        case 'B': return on ? RGB{60,100,140}   : RGB{195,210,225};
         case 'C': return on ? RGB{160,40,160}  : RGB{230,200,230};
         case 'D': return on ? RGB{200,120,40}  : RGB{240,220,180};
         case 'E': return on ? RGB{40,80,200}   : RGB{200,210,240};
         case 'F': return on ? RGB{40,160,60}   : RGB{200,235,200};
         case 'G': return on ? RGB{180,160,40}  : RGB{240,235,200};
+        case 'H': return on ? RGB{180,50,50}   : RGB{235,200,200};
+        case 'I': return on ? RGB{190,60,120}  : RGB{235,200,215};
+        case 'J': return on ? RGB{40,150,150}  : RGB{195,230,228};
+        case 'K': return on ? RGB{150,130,50}  : RGB{230,225,195};
+        case 'L': return on ? RGB{140,80,170}  : RGB{225,205,235};
         case 'X': return on ? RGB{200,40,200}  : RGB{240,180,240};
         default:  return on ? RGB{160,60,60}   : RGB{235,200,200};
     }
