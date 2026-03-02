@@ -124,67 +124,18 @@ static TuringMachine build_tm(const TMTestCase& test) {
 
 // --- Analytics data ---
 
-struct MismatchEntry { long long generation; int mismatch; };
+struct MismatchEntry { long long generation; int mismatch; int active_width; };
 
-struct TMStepInfo {
-    int tm_step, state, head_pos, tag_step;
-    long long cts_step;
-    std::vector<int> tape;
-};
-
-static bool tapes_match(const std::vector<int>& a, const std::vector<int>& b) {
-    auto effective_len = [](const std::vector<int>& t) -> int {
-        for (int i = (int)t.size() - 1; i >= 0; i--)
-            if (t[i] != 0) return i + 1;
-        return 0;
-    };
-    int la = effective_len(a), lb = effective_len(b);
-    if (la != lb) return false;
-    for (int i = 0; i < la; i++)
-        if (a[i] != b[i]) return false;
-    return true;
-}
-
-static std::vector<TMStepInfo> analyze_tm_boundaries(
-        const TMTestCase& test, int phi_size, int s) {
-    // Record TM execution history
-    TuringMachine tm_a = build_tm(test);
-    struct Snap { int state; std::vector<int> tape; int head_pos; };
-    std::vector<Snap> tm_hist;
-    tm_hist.push_back({tm_a.get_current_state(), tm_a.get_tape(), tm_a.get_head_pos()});
-    while (tm_a.step())
-        tm_hist.push_back({tm_a.get_current_state(), tm_a.get_tape(), tm_a.get_head_pos()});
-
-    std::vector<TMStepInfo> boundaries;
-    boundaries.push_back({0, tm_hist[0].state, tm_hist[0].head_pos, 0, 0, tm_hist[0].tape});
-
-    // Run tag system, decode at each step to find TM step boundaries
-    TuringMachine tm_b = build_tm(test);
-    TagSystem ts_a = TMToTagConverter::convert(tm_b);
-
-    int next_tm = 1;
-    int tag_steps = 0;
-    while (ts_a.step()) {
-        tag_steps++;
-        auto word = ts_a.get_word();
-        if (word.empty()) break;
-
-        TMConfig cfg = Decoder::tag_to_tm(word, test.num_states, test.num_symbols);
-        if (!cfg.valid) continue;
-
-        for (int idx = next_tm; idx < (int)tm_hist.size(); idx++) {
-            if (cfg.state == tm_hist[idx].state &&
-                cfg.head_pos == tm_hist[idx].head_pos &&
-                tapes_match(cfg.tape, tm_hist[idx].tape)) {
-                long long cts_step = (long long)tag_steps * s * phi_size;
-                boundaries.push_back({idx, tm_hist[idx].state, tm_hist[idx].head_pos,
-                                      tag_steps, cts_step, tm_hist[idx].tape});
-                next_tm = idx + 1;
-                break;
-            }
+static int measure_active_width(const Rule110Runner::State& current, size_t start, size_t end) {
+    int first = -1, last = -1;
+    for (size_t i = start + 14; i + 14 < end; i++) {
+        if (get_bit(current, i) != get_bit(current, i - 14) ||
+            get_bit(current, i) != get_bit(current, i + 14)) {
+            if (first < 0) first = (int)(i - start);
+            last = (int)(i - start);
         }
     }
-    return boundaries;
+    return (first >= 0) ? last - first : 0;
 }
 
 // --- Binary addition TM ---
@@ -298,6 +249,28 @@ int main(int argc, char* argv[]) {
     if (is_addition)
         show_addition_result(test.name, tm_check.get_tape());
 
+    // Write TM execution trace to tm_steps.csv
+    {
+        std::string trace_dir = "output/" + sanitize(test.name);
+        mkdir("output", 0755);
+        mkdir(trace_dir.c_str(), 0755);
+
+        TuringMachine tm_trace = build_tm(test);
+        std::ofstream tm_csv(trace_dir + "/tm_steps.csv");
+        tm_csv << "tm_step,state,head_pos,tape\n";
+        tm_csv << 0 << "," << tm_trace.get_current_state() << ","
+               << tm_trace.get_head_pos() << ",\""
+               << format_tape(tm_trace.get_tape()) << "\"\n";
+        int step_num = 0;
+        while (tm_trace.step()) {
+            step_num++;
+            tm_csv << step_num << "," << tm_trace.get_current_state() << ","
+                   << tm_trace.get_head_pos() << ",\""
+                   << format_tape(tm_trace.get_tape()) << "\"\n";
+        }
+        std::cout << "  Saved tm_steps.csv (" << (step_num + 1) << " rows)\n";
+    }
+
     TagSystem ts = TMToTagConverter::convert(tm);
     CyclicTagSystem cts = TagToCyclicConverter::convert(ts);
 
@@ -350,6 +323,17 @@ int main(int argc, char* argv[]) {
                     if (a != b) match = false;
                 }
                 std::cout << (match ? "  PASS" : "  FAIL") << "\n";
+
+                // Write decode.csv
+                {
+                    std::string decode_dir = "output/" + sanitize(test.name);
+                    std::ofstream df(decode_dir + "/decode.csv");
+                    df << "point,state,head_pos,tape,match\n";
+                    df << "initial," << cfg.state << "," << cfg.head_pos
+                       << ",\"" << format_tape(cfg.tape) << "\","
+                       << (match ? "true" : "false") << "\n";
+                    std::cout << "  Saved decode.csv\n";
+                }
             } else {
                 std::cout << "R110 decode: tag->TM decode failed\n";
             }
@@ -482,8 +466,9 @@ int main(int argc, char* argv[]) {
 
             if (g % 30 == 0) {
                 int mm = count_unsettled(*cur, prev30, center_start, center_end);
+                int aw = measure_active_width(*cur, center_start, center_end);
                 prev30 = *cur;
-                mismatch_log.push_back({g, mm});
+                mismatch_log.push_back({g, mm, aw});
                 if (mm < 300) {
                     halt_gen = g;
                     std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
@@ -552,12 +537,26 @@ int main(int argc, char* argv[]) {
             int mm = hl_settling_check(root, prev_check);
             if (interrupted.load()) break;
 
+            // Measure active width from buf_curr (populated by hl_settling_check)
+            int aw = 0;
+            {
+                int first = -1, last = -1;
+                for (size_t i = 14; i + 14 < buf_curr.size(); i++) {
+                    if (buf_curr[i] != buf_curr[i - 14] ||
+                        buf_curr[i] != buf_curr[i + 14]) {
+                        if (first < 0) first = (int)i;
+                        last = (int)i;
+                    }
+                }
+                aw = (first >= 0) ? last - first : 0;
+            }
+
             // Log-spaced mismatch sampling: only log when generation has
             // grown by ~10% since last entry (matches log-scale X axis)
             if (mismatch_log.empty() ||
                 search_gen >= (long long)(mismatch_log.back().generation * 1.1) ||
                 mm < 300) {
-                mismatch_log.push_back({search_gen, mm});
+                mismatch_log.push_back({search_gen, mm, aw});
             }
 
             if (mm < 300) {
@@ -608,8 +607,6 @@ int main(int argc, char* argv[]) {
         // === Analytics extraction (while HashLife tree is alive) ===
         if (halt_gen >= 0 && !interrupted.load()) {
             auto analytics_t0 = std::chrono::steady_clock::now();
-            int phi_size = (int)cts.get_appendants().size() / ts.get_deletion_number();
-            int s = test.num_symbols + 2;
 
             // 1. Spacetime diagram: sample center crops at logarithmic intervals
             {
@@ -663,65 +660,6 @@ int main(int argc, char* argv[]) {
             }
             spacetime_phase1.clear();
 
-            // 2. TM step boundary R110 spacetime windows
-            {
-                auto tm_bounds = analyze_tm_boundaries(test, phi_size, s);
-                double gens_per_cts = (cts_steps > 0) ? (double)halt_gen / cts_steps : 0;
-                const int TM_WINDOW = 200;
-
-                std::ofstream tm_csv(outdir + "/tm_steps.csv");
-                tm_csv << "tm_step,tag_step,cts_step,r110_gen,window_start,window_rows,state,head_pos,tape\n";
-
-                for (auto& b : tm_bounds) {
-                    long long r110_gen = (long long)(b.cts_step * gens_per_cts);
-                    r110_gen = (r110_gen / 30) * 30;
-
-                    // Window centered on r110_gen, but no earlier than initial_hl_gen
-                    long long win_start = std::max(initial_hl_gen,
-                                                    r110_gen - TM_WINDOW / 2);
-                    // Don't go past settling
-                    if (win_start + TM_WINDOW > halt_gen)
-                        win_start = std::max(initial_hl_gen, halt_gen - TM_WINDOW);
-
-                    tm_csv << b.tm_step << "," << b.tag_step << "," << b.cts_step
-                           << "," << r110_gen << "," << win_start << "," << TM_WINDOW
-                           << "," << b.state << "," << b.head_pos
-                           << ",\"" << format_tape(b.tape) << "\"\n";
-
-                    // Advance HashLife to window start, convert to packed state
-                    auto win_root = hl.advance(initial_root, win_start - initial_hl_gen);
-                    auto win_state = hl.to_packed_state(win_root, tape_size);
-
-                    // Write multi-row spacetime PPM via direct simulation
-                    std::string fname = outdir + "/tm_step_" + std::to_string(b.tm_step) + ".ppm";
-                    std::ofstream crop_ppm(fname, std::ios::binary);
-                    crop_ppm << "P6\n" << spacetime_crop_width << " " << TM_WINDOW << "\n255\n";
-
-                    Rule110Runner::State win_buf(win_state.size());
-                    Rule110Runner::State* w_cur = &win_state;
-                    Rule110Runner::State* w_nxt = &win_buf;
-                    std::vector<uint8_t> crop_row(spacetime_crop_width);
-
-                    for (int row = 0; row < TM_WINDOW; row++) {
-                        for (size_t i = 0; i < spacetime_crop_width; i++)
-                            crop_row[i] = get_bit(*w_cur, spacetime_crop_start + i);
-                        for (size_t i = 0; i < spacetime_crop_width; i++) {
-                            uint8_t v = crop_row[i] ? 0 : 255;
-                            crop_ppm.put(v); crop_ppm.put(v); crop_ppm.put(v);
-                        }
-                        if (row + 1 < TM_WINDOW) {
-                            Rule110Runner::next_generation(*w_cur, *w_nxt);
-                            std::swap(w_cur, w_nxt);
-                        }
-                    }
-                    std::cout << "    step " << b.tm_step << ": gen "
-                              << win_start << "-" << (win_start + TM_WINDOW)
-                              << " (target " << r110_gen << ")\n";
-                }
-                std::cout << "  TM steps: " << tm_bounds.size() << " boundaries ("
-                          << TM_WINDOW << " gens each)\n";
-            }
-
             double analytics_secs = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - analytics_t0).count();
             analytics_total_secs += analytics_secs;
@@ -772,8 +710,9 @@ int main(int argc, char* argv[]) {
 
             if (g % 30 == 0) {
                 int mm = count_unsettled(*cur, prev30, center_start, center_end);
+                int aw = measure_active_width(*cur, center_start, center_end);
                 prev30 = *cur;
-                mismatch_log.push_back({g, mm});
+                mismatch_log.push_back({g, mm, aw});
                 if (mm < 300) {
                     halt_gen = g;
                     std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
@@ -832,9 +771,10 @@ int main(int argc, char* argv[]) {
     // Write mismatch CSV
     {
         std::ofstream mf(outdir + "/mismatch.csv");
-        mf << "generation,mismatch\n";
+        mf << "generation,mismatch,active_width\n";
         for (size_t i = 0; i < mismatch_log.size(); i++)
-            mf << mismatch_log[i].generation << "," << mismatch_log[i].mismatch << "\n";
+            mf << mismatch_log[i].generation << "," << mismatch_log[i].mismatch
+               << "," << mismatch_log[i].active_width << "\n";
         std::cout << "  Saved mismatch.csv (" << mismatch_log.size() << " entries)\n";
     }
 

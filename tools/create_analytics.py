@@ -7,6 +7,7 @@ Usage:
 
 import argparse
 import csv
+import re
 import sys
 from pathlib import Path
 
@@ -22,42 +23,63 @@ except ImportError:
 
 
 def plot_mismatch(outdir: Path):
-    """Plot mismatch decay curve from mismatch.csv."""
+    """Plot mismatch decay and active width from mismatch.csv."""
     csv_path = outdir / "mismatch.csv"
     if not csv_path.exists():
         print("  No mismatch.csv found, skipping")
         return
 
-    gens, mismatches = [], []
+    gens, mismatches, widths = [], [], []
     with open(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
             g = int(row['generation'])
             m = int(row['mismatch'])
-            if g > 0:  # skip gen 0
+            w = int(row.get('active_width', 0))
+            if g > 0:
                 gens.append(g)
                 mismatches.append(m)
+                widths.append(w)
 
     if not gens:
         print("  No mismatch data, skipping")
         return
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(gens, mismatches, 'b-', linewidth=0.8, alpha=0.8)
-    ax.set_xscale('log')
-    ax.set_xlabel('Generation', fontsize=12)
-    ax.set_ylabel('Mismatch count (central region)', fontsize=12)
-    ax.set_title('Settling: mismatch decay over time', fontsize=14)
-    ax.grid(True, alpha=0.3)
+    fig, ax1 = plt.subplots(figsize=(12, 6))
 
-    # Mark the settling point (last entry with mm < 300)
+    color_mm = 'tab:blue'
+    ax1.plot(gens, mismatches, color=color_mm, linewidth=0.8, alpha=0.8, label='Mismatch')
+    ax1.set_xscale('log')
+    ax1.set_xlabel('Generation', fontsize=12)
+    ax1.set_ylabel('Mismatch count (central region)', fontsize=12, color=color_mm)
+    ax1.tick_params(axis='y', labelcolor=color_mm)
+    ax1.set_ylim(bottom=0)
+    ax1.grid(True, alpha=0.3)
+
+    # Active width on second Y axis
+    if any(w > 0 for w in widths):
+        ax2 = ax1.twinx()
+        color_aw = 'tab:orange'
+        ax2.plot(gens, widths, color=color_aw, linewidth=0.8, alpha=0.7, label='Active width')
+        ax2.set_ylabel('Active width (cells)', fontsize=12, color=color_aw)
+        ax2.tick_params(axis='y', labelcolor=color_aw)
+
+    # Mark the settling point
     for i in range(len(mismatches) - 1, -1, -1):
         if mismatches[i] < 300:
-            ax.axvline(x=gens[i], color='r', linestyle='--', alpha=0.5, label=f'Settled: gen {gens[i]:,}')
-            ax.legend(fontsize=10)
+            ax1.axvline(x=gens[i], color='r', linestyle='--', alpha=0.5,
+                        label=f'Settled: gen {gens[i]:,}')
             break
 
-    ax.set_ylim(bottom=0)
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    if any(w > 0 for w in widths):
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='upper right')
+    else:
+        ax1.legend(fontsize=10)
+
+    ax1.set_title('Settling: mismatch and active width over time', fontsize=14)
     fname = outdir / "mismatch_plot.png"
     fig.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -84,15 +106,6 @@ def annotate_spacetime(outdir: Path):
             for row in reader:
                 gen_map[int(row['row'])] = int(row['generation'])
 
-    # Read TM step boundaries for markers
-    tm_steps_path = outdir / "tm_steps.csv"
-    tm_gens = []
-    if tm_steps_path.exists():
-        with open(tm_steps_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                tm_gens.append((int(row['tm_step']), int(row['r110_gen'])))
-
     # Create figure with the image and generation axis
     fig, ax = plt.subplots(figsize=(10, max(6, h / 200)))
 
@@ -103,7 +116,6 @@ def annotate_spacetime(outdir: Path):
 
     # Replace Y tick labels with generation numbers
     if gen_map:
-        # Pick ~10 evenly spaced rows for labels
         label_rows = []
         for target in range(0, h, max(1, h // 10)):
             if target in gen_map:
@@ -114,24 +126,14 @@ def annotate_spacetime(outdir: Path):
         ax.set_yticks(label_rows)
         ax.set_yticklabels([f'{gen_map[r]:,}' for r in label_rows], fontsize=8)
 
-    # Mark TM step boundaries
-    if tm_gens and gen_map:
-        all_gens = list(gen_map.values())
-        for tm_step, r110_gen in tm_gens:
-            # Find closest row
-            best_row = min(gen_map.keys(), key=lambda r: abs(gen_map[r] - r110_gen))
-            ax.axhline(y=best_row, color='r', linestyle='--', alpha=0.4, linewidth=0.8)
-            ax.text(w + 10, best_row, f'TM step {tm_step}', fontsize=7,
-                    color='red', va='center', clip_on=False)
-
     fname = outdir / "spacetime.png"
     fig.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  {fname.name}")
 
 
-def create_tm_sidebyside(outdir: Path):
-    """Create TM / R110 side-by-side composite from tm_steps.csv and tm_step_N.ppm."""
+def plot_tm_trace(outdir: Path):
+    """Visualize TM execution trace from tm_steps.csv with decode verification."""
     csv_path = outdir / "tm_steps.csv"
     if not csv_path.exists():
         print("  No tm_steps.csv found, skipping")
@@ -147,9 +149,6 @@ def create_tm_sidebyside(outdir: Path):
                 'tm_step': int(row['tm_step']),
                 'state': int(row['state']),
                 'head_pos': int(row['head_pos']),
-                'r110_gen': int(row['r110_gen']),
-                'window_start': int(row.get('window_start', row['r110_gen'])),
-                'window_rows': int(row.get('window_rows', 1)),
                 'tape': tape,
             })
 
@@ -157,80 +156,138 @@ def create_tm_sidebyside(outdir: Path):
         print("  No TM steps data, skipping")
         return
 
-    # Load R110 spacetime window images
-    crops = {}
-    for s in steps:
-        ppm_path = outdir / f"tm_step_{s['tm_step']}.ppm"
-        if ppm_path.exists():
-            crops[s['tm_step']] = Image.open(ppm_path)
+    # Read decode.csv for verification annotation
+    decode_info = None
+    decode_path = outdir / "decode.csv"
+    if decode_path.exists():
+        with open(decode_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                decode_info = {
+                    'point': row['point'],
+                    'state': int(row['state']),
+                    'head_pos': int(row['head_pos']),
+                    'match': row['match'].strip().lower() == 'true',
+                }
 
-    # TM symbol colors
     sym_colors = ['#FFFFFF', '#4CAF50', '#2196F3', '#FF9800', '#9C27B0',
                   '#F44336', '#00BCD4', '#FFEB3B']
 
     n = len(steps)
-    fig_height = 4 * n + 1
-    fig, axes = plt.subplots(n, 2, figsize=(16, fig_height),
-                              gridspec_kw={'width_ratios': [1, 6]},
-                              squeeze=False)
+    max_tape = max(max(len(s['tape']), s['head_pos'] + 1) for s in steps)
+    max_cells = max(max_tape, 3)
+    cell_size = min(1.0, 8.0 / max_cells)
+
+    fig_width = max(6, max_cells * cell_size + 3)
+    row_height = 1.2
+    fig_height = max(3, n * row_height + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
     for i, s in enumerate(steps):
-        ax_tm = axes[i][0]
-        ax_r110 = axes[i][1]
-
-        # Draw TM tape
+        y = n - 1 - i  # draw from top to bottom
         tape = s['tape']
-        max_cells = max(len(tape), 5)
+
         for j in range(max_cells):
             val = tape[j] if j < len(tape) else 0
             color = sym_colors[val % len(sym_colors)]
-            ax_tm.add_patch(plt.Rectangle((j, 0), 1, 1, facecolor=color,
-                                           edgecolor='black', linewidth=1))
-            ax_tm.text(j + 0.5, 0.5, str(val), ha='center', va='center',
-                       fontsize=12, fontweight='bold')
+            ax.add_patch(plt.Rectangle((j * cell_size, y * row_height),
+                                        cell_size, cell_size * 0.9,
+                                        facecolor=color, edgecolor='black',
+                                        linewidth=0.8))
+            ax.text(j * cell_size + cell_size / 2, y * row_height + cell_size * 0.45,
+                    str(val), ha='center', va='center',
+                    fontsize=max(6, int(10 * cell_size)), fontweight='bold')
+
             # Head marker
             if j == s['head_pos']:
-                ax_tm.annotate('', xy=(j + 0.5, -0.1), xytext=(j + 0.5, -0.5),
-                               arrowprops=dict(arrowstyle='->', color='red', lw=2))
+                ax.annotate('', xy=(j * cell_size + cell_size / 2, y * row_height - 0.05),
+                            xytext=(j * cell_size + cell_size / 2, y * row_height - 0.25),
+                            arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
 
-        ax_tm.set_xlim(-0.5, max_cells + 0.5)
-        ax_tm.set_ylim(-0.8, 1.5)
-        ax_tm.set_aspect('equal')
-        ax_tm.axis('off')
-        ax_tm.set_title(f'TM step {s["tm_step"]}\nstate={s["state"]}',
-                         fontsize=10, pad=2)
+        # Step label
+        ax.text(-0.3, y * row_height + cell_size * 0.45,
+                f't={s["tm_step"]}  q{s["state"]}', ha='right', va='center',
+                fontsize=9, fontfamily='monospace')
 
-        # Draw R110 spacetime window
-        if s['tm_step'] in crops:
-            crop_img = crops[s['tm_step']]
-            ax_r110.imshow(crop_img, aspect='auto', cmap='gray',
-                           interpolation='nearest')
-            win_start = s['window_start']
-            win_rows = s['window_rows']
-            target = s['r110_gen']
-            ax_r110.set_title(
-                f'R110 spacetime @ gen {win_start:,} \u2013 {win_start + win_rows:,}'
-                f'  (TM step {s["tm_step"]} \u2248 gen {target:,})',
-                fontsize=9)
-            # Mark the target generation within the window
-            target_row = target - win_start
-            if 0 <= target_row < win_rows:
-                ax_r110.axhline(y=target_row, color='r', linestyle='--',
-                                alpha=0.6, linewidth=0.8)
-        else:
-            ax_r110.text(0.5, 0.5, 'No R110 data', ha='center', va='center',
-                         transform=ax_r110.transAxes, fontsize=12)
-            ax_r110.set_title(f'R110 @ gen {s["r110_gen"]:,}', fontsize=9)
+    # Decode verification annotation at step 0
+    if decode_info and decode_info['point'] == 'initial':
+        status = 'PASS' if decode_info['match'] else 'FAIL'
+        color = '#2e7d32' if decode_info['match'] else '#c62828'
+        ax.text(max_cells * cell_size + 0.2, (n - 1) * row_height + cell_size * 0.45,
+                f'R110 decode: {status}',
+                ha='left', va='center', fontsize=9, fontweight='bold',
+                color=color,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='#f5f5f5',
+                          edgecolor=color, alpha=0.8))
 
-        ax_r110.set_xlabel('Cell position (center crop)', fontsize=8)
-        ax_r110.set_ylabel('Generation', fontsize=8)
+    ax.set_xlim(-max(2, len(f't={steps[-1]["tm_step"]}  q0') * 0.09), max_cells * cell_size + 2.5)
+    ax.set_ylim(-0.5, n * row_height + 0.3)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_title('Turing Machine execution trace', fontsize=13, pad=10)
 
-    fig.suptitle('Turing Machine steps \u2194 Rule 110 spacetime', fontsize=14, y=1.01)
-    fig.tight_layout()
-    fname = outdir / "tm_r110_sidebyside.png"
+    fname = outdir / "tm_trace.png"
     fig.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  {fname.name}")
+
+
+def annotate_head_tail(outdir: Path):
+    """Annotate head and tail PPM images with generation scales and region labels."""
+    # Try PNG first (from convert_images.py), then PPM
+    for suffix, label in [('head', 'Head'), ('tail', 'Tail')]:
+        png_path = outdir / f"{suffix}_center.png"
+        ppm_path = outdir / f"{suffix}.ppm"
+        src_path = png_path if png_path.exists() else ppm_path
+        if not src_path.exists():
+            print(f"  No {suffix} image found, skipping")
+            continue
+
+        img = Image.open(src_path)
+        w, h = img.size
+        print(f"  {src_path.name}: {w}x{h}")
+
+        # Determine generation range
+        gen_start, gen_end = 0, h - 1
+        if suffix == 'head':
+            gen_start = 0
+            gen_end = h - 1
+        elif suffix == 'tail':
+            # Read summary.txt to find settling gen and tail start
+            summary_path = outdir / "summary.txt"
+            if summary_path.exists():
+                text = summary_path.read_text()
+                m = re.search(r'Settled: gen (\d+)', text)
+                if m:
+                    gen_end = int(m.group(1))
+                    gen_start = gen_end - h + 1
+
+        fig, ax = plt.subplots(figsize=(10, max(6, h / 200)))
+        ax.imshow(img, aspect='auto')
+        ax.set_xlabel('Cell position', fontsize=10)
+
+        # Y axis with generation labels
+        n_ticks = min(10, h)
+        tick_positions = [int(i * (h - 1) / max(1, n_ticks - 1)) for i in range(n_ticks)]
+        tick_labels = [f'{gen_start + int(p * (gen_end - gen_start) / max(1, h - 1)):,}'
+                       for p in tick_positions]
+        ax.set_yticks(tick_positions)
+        ax.set_yticklabels(tick_labels, fontsize=8)
+        ax.set_ylabel('Generation', fontsize=10)
+
+        # Region labels at top
+        ax.text(0.15, 1.02, 'left periodic', ha='center', va='bottom',
+                transform=ax.transAxes, fontsize=8, color='gray', style='italic')
+        ax.text(0.5, 1.02, 'central', ha='center', va='bottom',
+                transform=ax.transAxes, fontsize=8, color='gray', style='italic')
+        ax.text(0.85, 1.02, 'right periodic', ha='center', va='bottom',
+                transform=ax.transAxes, fontsize=8, color='gray', style='italic')
+
+        ax.set_title(f'{label} spacetime', fontsize=12, pad=20)
+        fname = outdir / f"{suffix}_annotated.png"
+        fig.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  {fname.name}")
 
 
 def main():
@@ -245,14 +302,17 @@ def main():
 
     print(f"Creating analytics for {d}\n")
 
-    print("1. Mismatch decay curve")
+    print("1. Mismatch + active width")
     plot_mismatch(d)
 
     print("\n2. Spacetime diagram")
     annotate_spacetime(d)
 
-    print("\n3. TM / R110 side-by-side")
-    create_tm_sidebyside(d)
+    print("\n3. TM execution trace")
+    plot_tm_trace(d)
+
+    print("\n4. Head/tail annotations")
+    annotate_head_tail(d)
 
     print(f"\nDone. All visualizations saved to {d}/")
 
