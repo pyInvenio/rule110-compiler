@@ -6,6 +6,7 @@
 #include "HashLife1D.hpp"
 #include "Verifier.hpp"
 #include "Decoder.hpp"
+#include "BlockDetector.hpp"
 #include <iostream>
 #include <fstream>
 #include <deque>
@@ -46,31 +47,11 @@ static RGB block_color(char block, bool on) {
         case 'E': return on ? RGB{40,80,200}   : RGB{200,210,240};
         case 'F': return on ? RGB{40,160,60}   : RGB{200,235,200};
         case 'G': return on ? RGB{180,160,40}  : RGB{240,235,200};
-        default:  return on ? RGB{160,60,60}   : RGB{235,200,200}; // H-L
+        case 'X': return on ? RGB{200,40,200}  : RGB{240,180,240};
+        default:  return on ? RGB{160,60,60}   : RGB{235,200,200};
     }
 }
 
-static void write_ppm_row(std::ofstream& ofs,
-                           const std::vector<uint8_t>& row,
-                           const std::vector<char>& block_map,
-                           size_t view_start, size_t width) {
-    for (size_t i = 0; i < width; i++) {
-        size_t pos = view_start + i;
-        char block = (pos < block_map.size()) ? block_map[pos] : 'A';
-        RGB c = block_color(block, row[i] != 0);
-        ofs.put(c.r); ofs.put(c.g); ofs.put(c.b);
-    }
-}
-
-// Ether detection via spatial periodicity.
-// A blocks have exact period 14.
-static inline bool is_ether_spatial(const std::vector<uint8_t>& row, size_t i, size_t width) {
-    if (i < 14 || i + 14 >= width) return false;
-    return row[i] == row[i - 14] && row[i] == row[i + 14];
-}
-
-// Write PPM row using a propagated color map.
-// color_map[i] = block type for each pixel, propagated from previous generation.
 static void write_ppm_row_colored(std::ofstream& ofs,
                                     const std::vector<uint8_t>& row,
                                     const std::vector<char>& color_map,
@@ -78,37 +59,6 @@ static void write_ppm_row_colored(std::ofstream& ofs,
     for (size_t i = 0; i < width; i++) {
         RGB c = block_color(color_map[i], row[i] != 0);
         ofs.put(c.r); ofs.put(c.g); ofs.put(c.b);
-    }
-}
-
-// Propagate color map forward one generation.
-// Simple approach: ether cells are gray, non-ether cells inherit from
-// nearest non-ether cell in previous generation (no velocity assumption).
-// Gliders are separated by hundreds of cells of ether, so nearest-neighbor
-// search reliably finds the same glider's color.
-static void propagate_colors(const std::vector<uint8_t>& row, size_t width,
-                              const std::vector<char>& prev_colors,
-                              std::vector<char>& curr_colors) {
-    curr_colors.resize(width);
-
-    for (size_t i = 0; i < width; i++) {
-        // Ether check is definitive
-        if (is_ether_spatial(row, i, width)) {
-            curr_colors[i] = 'A';
-            continue;
-        }
-
-        // Non-ether: inherit from nearest non-ether cell in previous gen.
-        // Search outward from position i. Gliders shift ~10-24 cells/gen,
-        // and are separated by hundreds of cells of ether, so radius 40
-        // is safe (finds same glider, not adjacent one).
-        char c = 'A';
-        for (int d = 0; d <= 40; d++) {
-            int lo = (int)i - d, hi = (int)i + d;
-            if (lo >= 0 && prev_colors[lo] != 'A') { c = prev_colors[lo]; break; }
-            if (d > 0 && hi < (int)width && prev_colors[hi] != 'A') { c = prev_colors[hi]; break; }
-        }
-        curr_colors[i] = c;
     }
 }
 
@@ -152,6 +102,11 @@ static std::string format_tape(const TuringMachine::Tape& tape) {
     return s + "]";
 }
 
+static double elapsed_ms(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
 static TuringMachine build_tm(const TMTestCase& test) {
     TuringMachine tm(test.num_states, test.num_symbols);
     for (const auto& t : test.transitions)
@@ -164,7 +119,6 @@ static TuringMachine build_tm(const TMTestCase& test) {
 // --- Binary addition TM ---
 
 static TMTestCase build_addition_test(int x, int y) {
-    // Convert to binary LSB first
     std::vector<int> x_bits, y_bits;
     int xx = x, yy = y;
     while (xx > 0 || yy > 0) {
@@ -175,13 +129,10 @@ static TMTestCase build_addition_test(int x, int y) {
     }
     if (x_bits.empty()) { x_bits.push_back(0); y_bits.push_back(0); }
 
-    // Build paired tape: symbol = 1 + a*2 + b
-    // 1=(0,0), 2=(0,1), 3=(1,0), 4=(1,1)
     std::vector<int> tape;
     for (size_t i = 0; i < x_bits.size(); i++)
         tape.push_back(1 + x_bits[i] * 2 + y_bits[i]);
 
-    // Binary addition transitions
     std::vector<TMTestCase::TransitionDef> transitions = {
         {0, 1, 0, 1, Move::RIGHT}, {0, 2, 0, 2, Move::RIGHT},
         {0, 3, 0, 4, Move::RIGHT}, {0, 4, 1, 3, Move::RIGHT},
@@ -190,7 +141,6 @@ static TMTestCase build_addition_test(int x, int y) {
         {1, 3, 1, 3, Move::RIGHT}, {1, 4, 1, 4, Move::RIGHT},
     };
 
-    // Run TM to get expected result
     TuringMachine tm(2, 5);
     for (const auto& t : transitions)
         tm.add_transition(t.state, t.symbol, t.next_state, t.write_symbol, t.move);
@@ -209,7 +159,6 @@ static TMTestCase build_addition_test(int x, int y) {
 
 static void show_addition_result(const std::string& name,
                                   const TuringMachine::Tape& result_tape) {
-    // Extract b-bits from paired encoding (LSB first)
     std::string bits_str;
     int result = 0;
     for (int i = (int)result_tape.size() - 1; i >= 0; i--) {
@@ -217,7 +166,6 @@ static void show_addition_result(const std::string& name,
         result = result * 2 + b;
         bits_str += std::to_string(b);
     }
-
     std::cout << "\n  Result (b-bits MSB first): " << bits_str
               << " = " << result << "\n";
     std::cout << "  " << name << " = " << result << "\n";
@@ -226,6 +174,7 @@ static void show_addition_result(const std::string& name,
 // --- Main ---
 
 int main(int argc, char* argv[]) {
+    std::cout.setf(std::ios::unitbuf);
     auto tests = Verifier::get_tm_tests();
     TMTestCase test;
     bool is_addition = false;
@@ -260,13 +209,14 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < (int)tests.size(); i++)
             std::cout << "  " << i << ": " << tests[i].name
                       << (i == test_idx ? "  <--" : "") << "\n";
-
-        // Check if this is the predefined addition test
         if (test.num_symbols == 5 && test.num_states == 2)
             is_addition = true;
     }
 
-    // TM ground truth
+    // --- Compile: TM -> Tag -> CTS -> R110 ---
+
+    auto compile_t0 = std::chrono::steady_clock::now();
+
     TuringMachine tm = build_tm(test);
     TuringMachine tm_check = build_tm(test);
     int tm_steps = 0;
@@ -277,7 +227,6 @@ int main(int argc, char* argv[]) {
     if (is_addition)
         show_addition_result(test.name, tm_check.get_tape());
 
-    // Pipeline: TM -> Tag -> CTS
     TagSystem ts = TMToTagConverter::convert(tm);
     CyclicTagSystem cts = TagToCyclicConverter::convert(ts);
 
@@ -287,22 +236,22 @@ int main(int argc, char* argv[]) {
     std::cout << "CTS: " << cts.get_appendants().size() << " appendants, "
               << cts.tape_length() << " tape, halts in " << cts_steps << " steps\n";
 
-    // CTS -> R110
     Rule110State r110 = Rule110Compiler::compile(cts);
 
-    // Build full block map for color images
     std::vector<char> block_map;
     block_map.insert(block_map.end(), r110.left_block_map.begin(), r110.left_block_map.end());
     block_map.insert(block_map.end(), r110.central_block_map.begin(), r110.central_block_map.end());
     block_map.insert(block_map.end(), r110.right_block_map.begin(), r110.right_block_map.end());
 
+    double compile_ms = elapsed_ms(compile_t0);
+    std::cout << "Compile: " << compile_ms << "ms  (TM -> Tag -> CTS -> R110)\n";
+
     std::cout << "Regions: left=" << r110.left_periodic.size()
               << " central=" << r110.central_part.size()
               << " right=" << r110.right_periodic.size() << "\n";
 
-    // Decode initial R110 tape back to TM config via block map
+    // Decode initial R110 tape back to TM config
     {
-        // Extract CTS bits from central block map: E=0, F=1
         std::vector<int> decoded_cts;
         for (size_t i = 0; i < r110.central_block_map.size(); ) {
             char b = r110.central_block_map[i];
@@ -321,10 +270,8 @@ int main(int argc, char* argv[]) {
                 std::cout << "R110 decode: state=" << cfg.state
                           << ", tape=" << format_tape(cfg.tape)
                           << ", head=" << cfg.head_pos;
-                // Verify matches input
                 bool match = (cfg.state == test.initial_state &&
                               cfg.head_pos == test.head_pos);
-                // Compare tapes (ignoring trailing blanks)
                 size_t len = std::max(cfg.tape.size(), test.initial_tape.size());
                 for (size_t i = 0; i < len && match; i++) {
                     int a = (i < cfg.tape.size()) ? cfg.tape[i] : 0;
@@ -347,10 +294,27 @@ int main(int argc, char* argv[]) {
     size_t center_end = tape_int.size();
     tape_int.insert(tape_int.end(), r110.right_periodic.begin(), r110.right_periodic.end());
 
+    const size_t MAX_VIEW = 250000;
+    size_t tape_size_total = tape_int.size();
+    size_t central_width = center_end - center_start;
+    size_t view_width = std::min(central_width + 4000, MAX_VIEW);
     size_t view_start = (center_start > 2000) ? center_start - 2000 : 0;
-    size_t view_width = (center_end - center_start) + 4000;
-    std::cout << "R110: " << tape_int.size() << " cells, central="
-              << (center_end - center_start) << "\n";
+
+    // Second view for right side when central part is too wide
+    // Centered on center_end to show transition from central to right periodic
+    bool has_right_view = (central_width + 4000 > MAX_VIEW);
+    size_t view_start_r = 0, view_width_r = 0;
+    if (has_right_view) {
+        view_start_r = (center_end > MAX_VIEW / 2) ? center_end - MAX_VIEW / 2 : 0;
+        size_t right_end = std::min(view_start_r + MAX_VIEW, tape_size_total);
+        view_width_r = right_end - view_start_r;
+    }
+
+    std::cout << "R110: " << tape_size_total << " cells, central="
+              << central_width;
+    if (has_right_view)
+        std::cout << " (2 views: " << view_width << " + " << view_width_r << ")";
+    std::cout << "\n";
 
     std::string outdir = "output/" + sanitize(test.name);
     mkdir("output", 0755);
@@ -359,15 +323,14 @@ int main(int argc, char* argv[]) {
     Rule110Runner::State state = Rule110Runner::pack(tape_int);
     std::vector<int>().swap(tape_int);
 
-    // Simulation params
     const int HEAD_GENS = 4800;
     const size_t TAIL_BUDGET = 200ULL * 1024 * 1024;
-    const int tail_save = std::max(100, std::min(2000, (int)(TAIL_BUDGET / view_width)));
+    size_t total_view_bytes = view_width + (has_right_view ? view_width_r : 0);
+    const int tail_save = std::max(100, std::min(2000, (int)(TAIL_BUDGET / total_view_bytes)));
 
     std::cout << "Tail buffer: " << tail_save << " rows ("
-              << view_width * tail_save / (1024 * 1024) << " MB)\n";
+              << total_view_bytes * tail_save / (1024 * 1024) << " MB)\n";
 
-    // Double-buffer: two pre-allocated states, swap instead of allocating
     Rule110Runner::State buf_b(state.size());
     Rule110Runner::State* cur = &state;
     Rule110Runner::State* nxt = &buf_b;
@@ -376,34 +339,49 @@ int main(int argc, char* argv[]) {
     long long halt_gen = -1, current_gen = 0;
 
     std::signal(SIGINT, signal_handler);
+
+    auto run_t0 = std::chrono::steady_clock::now();
     std::cout << "\nRunning (Ctrl+C to stop)...\n\n";
 
     // Phase 1: head image (brute-force, first HEAD_GENS generations)
+    BlockDetector detector;
     {
         std::ofstream head_ppm(outdir + "/head.ppm", std::ios::binary);
         head_ppm << "P6\n" << view_width << " " << (HEAD_GENS + 1) << "\n255\n";
-        std::vector<uint8_t> row_buf;
-        extract_row(*cur, view_start, view_width, row_buf);
 
-        // Initialize color map from exact gen-0 block_map.
-        // A/B blocks → ether (gray). Everything else keeps its color.
-        std::vector<char> color_map(view_width), prev_color_map(view_width);
-        for (size_t i = 0; i < view_width; i++) {
-            size_t pos = view_start + i;
-            char b = (pos < block_map.size()) ? block_map[pos] : 'A';
-            if (b == 'A' || b == 'B') b = 'A';
-            color_map[i] = b;
+        std::ofstream head_r_ppm;
+        if (has_right_view) {
+            head_r_ppm.open(outdir + "/head_r.ppm", std::ios::binary);
+            head_r_ppm << "P6\n" << view_width_r << " " << (HEAD_GENS + 1) << "\n255\n";
         }
-        write_ppm_row_colored(head_ppm, row_buf, color_map, view_width);
+
+        std::vector<uint8_t> row_buf, row_buf_r;
+        BlockDetector detector_r;
+
+        extract_row(*cur, view_start, view_width, row_buf);
+        detector.init(row_buf, block_map, view_start, view_width);
+        write_ppm_row_colored(head_ppm, row_buf, detector.color_map(), view_width);
+
+        if (has_right_view) {
+            extract_row(*cur, view_start_r, view_width_r, row_buf_r);
+            detector_r.init(row_buf_r, block_map, view_start_r, view_width_r);
+            write_ppm_row_colored(head_r_ppm, row_buf_r, detector_r.color_map(), view_width_r);
+        }
 
         for (long long g = 1; g <= HEAD_GENS && !interrupted.load(); g++) {
-            prev_color_map.swap(color_map);
             Rule110Runner::next_generation(*cur, *nxt);
             std::swap(cur, nxt);
             current_gen = g;
+
             extract_row(*cur, view_start, view_width, row_buf);
-            propagate_colors(row_buf, view_width, prev_color_map, color_map);
-            write_ppm_row_colored(head_ppm, row_buf, color_map, view_width);
+            detector.advance(row_buf, view_width);
+            write_ppm_row_colored(head_ppm, row_buf, detector.color_map(), view_width);
+
+            if (has_right_view) {
+                extract_row(*cur, view_start_r, view_width_r, row_buf_r);
+                detector_r.advance(row_buf_r, view_width_r);
+                write_ppm_row_colored(head_r_ppm, row_buf_r, detector_r.color_map(), view_width_r);
+            }
 
             if (g % 30 == 0) {
                 int mm = count_unsettled(*cur, prev30, center_start, center_end);
@@ -416,18 +394,20 @@ int main(int argc, char* argv[]) {
             }
         }
         head_ppm.close();
-        std::cout << "  Saved head.ppm (" << current_gen << " gens)\n";
+        if (has_right_view) head_r_ppm.close();
+        std::cout << "  Saved head.ppm (" << current_gen << " gens, "
+                  << detector.clusters().size() << " clusters)";
+        if (has_right_view) std::cout << " + head_r.ppm";
+        std::cout << "\n";
     }
 
     // Phase 2: HashLife fast compute (if not settled in phase 1)
     if (halt_gen < 0 && !interrupted.load()) {
         auto t0 = std::chrono::steady_clock::now();
 
-        // Extract ether pattern (period 14) from left_periodic
         std::vector<int> ether_pat(r110.left_periodic.begin(),
                                     r110.left_periodic.begin() + std::min((size_t)14, r110.left_periodic.size()));
 
-        // Convert flat state to individual bits for hashlife
         size_t tape_size = state.size() * 64;
         std::vector<int> flat_tape(tape_size);
         for (size_t i = 0; i < tape_size; i++)
@@ -435,12 +415,11 @@ int main(int argc, char* argv[]) {
 
         HashLife1D hl;
         HashLife1D::Node* root = hl.from_bits(flat_tape, ether_pat);
-        std::vector<int>().swap(flat_tape);  // free memory
+        std::vector<int>().swap(flat_tape);
 
         std::cout << "  HashLife: " << hl.node_count() << " nodes, "
                   << hl.canon_size() << " canonical\n";
 
-        // Settling check: extract center region to flat buffer, then compare
         size_t settle_start = center_start;
         size_t settle_len = center_end - center_start + 720;
         std::vector<uint8_t> buf_curr, buf_prev;
@@ -450,14 +429,11 @@ int main(int argc, char* argv[]) {
             hl.extract_bits(curr_root, settle_start, settle_len, buf_curr);
             hl.extract_bits(prev_root, settle_start, settle_len, buf_prev);
             int mm = 0;
-            for (size_t i = 720; i < settle_len; i++) {
-                if (buf_curr[i] != buf_prev[i - 720])
-                    mm++;
-            }
+            for (size_t i = 720; i < settle_len; i++)
+                if (buf_curr[i] != buf_prev[i - 720]) mm++;
             return mm;
         };
 
-        // Exponential settling search
         long long step_size = 30;
         long long search_gen = current_gen;
         HashLife1D::Node* last_unsettled_root = root;
@@ -468,15 +444,12 @@ int main(int argc, char* argv[]) {
             root = hl.advance(root, step_size);
             search_gen += step_size;
 
-            // Advance prev30 to (search_gen - 30)
             HashLife1D::Node* prev_check = (step_size > 30)
                 ? hl.advance(prev30_root, step_size - 30)
                 : prev30_root;
 
             if (interrupted.load()) break;
-
             int mm = hl_settling_check(root, prev_check);
-
             if (interrupted.load()) break;
 
             if (mm < 300) {
@@ -510,7 +483,6 @@ int main(int argc, char* argv[]) {
 
                 HashLife1D::Node* mid_root = hl.advance(base_root, mid - lo);
                 HashLife1D::Node* prev_root = hl.advance(base_root, mid - lo - 30);
-
                 int mm = hl_settling_check(mid_root, prev_root);
 
                 if (mm < 300) {
@@ -525,17 +497,14 @@ int main(int argc, char* argv[]) {
             std::cout << "  Narrowed to [" << lo << ", " << hi << "]\n";
         }
 
-        // Convert hashlife state back to flat for tail phase
         auto flat_final = hl.to_packed_state(last_unsettled_root, tape_size);
         *cur = std::move(flat_final);
         current_gen = last_unsettled_gen;
 
-        auto t1 = std::chrono::steady_clock::now();
-        double secs = std::chrono::duration<double>(t1 - t0).count();
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::cout << "  HashLife phase: " << secs << "s, "
                   << hl.node_count() << " nodes\n";
 
-        // Brute-force from narrowed bracket to find exact settling gen + tail rows
         buf_b.resize(cur->size());
         nxt = &buf_b;
         prev30 = *cur;
@@ -544,12 +513,14 @@ int main(int argc, char* argv[]) {
 
     // Phase 3: tail image (brute-force, rolling buffer)
     {
-        std::deque<std::vector<uint8_t>> tail_rows;
-        std::vector<uint8_t> row_buf;
-
-        // Record current row
+        std::deque<std::vector<uint8_t>> tail_rows, tail_rows_r;
+        std::vector<uint8_t> row_buf, row_buf_r;
         extract_row(*cur, view_start, view_width, row_buf);
         tail_rows.push_back(row_buf);
+        if (has_right_view) {
+            extract_row(*cur, view_start_r, view_width_r, row_buf_r);
+            tail_rows_r.push_back(row_buf_r);
+        }
 
         for (long long g = current_gen + 1; !interrupted.load(); g++) {
             Rule110Runner::next_generation(*cur, *nxt);
@@ -560,6 +531,13 @@ int main(int argc, char* argv[]) {
             tail_rows.push_back(row_buf);
             if ((int)tail_rows.size() > tail_save)
                 tail_rows.pop_front();
+
+            if (has_right_view) {
+                extract_row(*cur, view_start_r, view_width_r, row_buf_r);
+                tail_rows_r.push_back(row_buf_r);
+                if ((int)tail_rows_r.size() > tail_save)
+                    tail_rows_r.pop_front();
+            }
 
             if (g % 30 == 0) {
                 int mm = count_unsettled(*cur, prev30, center_start, center_end);
@@ -573,37 +551,51 @@ int main(int argc, char* argv[]) {
         }
 
         long long tail_start = current_gen - (long long)tail_rows.size() + 1;
+
+        // Write left tail
         {
             std::ofstream tail_ppm(outdir + "/tail.ppm", std::ios::binary);
             tail_ppm << "P6\n" << view_width << " " << tail_rows.size() << "\n255\n";
 
-            // Initialize first tail row: ether=gray, non-ether=gray too (no gen-0 projection).
-            // Propagation from first row will color subsequent rows from their neighbors.
-            std::vector<char> tail_colors(view_width, 'A'), tail_prev(view_width);
-            // Try to seed colors: for non-ether cells, assign based on position
-            // relative to center region (central blocks = blue/green, right = red).
-            size_t center_view_start = center_start - view_start;
-            size_t center_view_end_tail = center_end - view_start;
-            for (size_t i = 0; i < view_width; i++) {
-                if (!is_ether_spatial(tail_rows[0], i, view_width)) {
-                    if (i >= center_view_start && i < center_view_end_tail)
-                        tail_colors[i] = 'E';  // central region default
-                    else if (i >= center_view_end_tail)
-                        tail_colors[i] = 'H';  // right region default
-                }
-            }
-            write_ppm_row_colored(tail_ppm, tail_rows[0], tail_colors, view_width);
+            size_t cv_start = center_start - view_start;
+            size_t cv_end = std::min(center_end - view_start, view_width);
+            BlockDetector tail_detector;
+            tail_detector.init_from_ether(tail_rows[0], view_width,
+                                           cv_start, cv_end, (int)tail_start);
+            write_ppm_row_colored(tail_ppm, tail_rows[0], tail_detector.color_map(), view_width);
 
-            // Propagate for subsequent rows
             for (size_t r = 1; r < tail_rows.size(); r++) {
-                tail_prev.swap(tail_colors);
-                propagate_colors(tail_rows[r], view_width, tail_prev, tail_colors);
-                write_ppm_row_colored(tail_ppm, tail_rows[r], tail_colors, view_width);
+                tail_detector.advance(tail_rows[r], view_width);
+                write_ppm_row_colored(tail_ppm, tail_rows[r], tail_detector.color_map(), view_width);
             }
         }
+
+        // Write right tail
+        if (has_right_view) {
+            std::ofstream tail_r_ppm(outdir + "/tail_r.ppm", std::ios::binary);
+            tail_r_ppm << "P6\n" << view_width_r << " " << tail_rows_r.size() << "\n255\n";
+
+            size_t cv_start_r = (center_start > view_start_r) ? center_start - view_start_r : 0;
+            size_t cv_end_r = std::min(center_end - view_start_r, view_width_r);
+            BlockDetector tail_detector_r;
+            tail_detector_r.init_from_ether(tail_rows_r[0], view_width_r,
+                                             cv_start_r, cv_end_r, (int)tail_start);
+            write_ppm_row_colored(tail_r_ppm, tail_rows_r[0], tail_detector_r.color_map(), view_width_r);
+
+            for (size_t r = 1; r < tail_rows_r.size(); r++) {
+                tail_detector_r.advance(tail_rows_r[r], view_width_r);
+                write_ppm_row_colored(tail_r_ppm, tail_rows_r[r], tail_detector_r.color_map(), view_width_r);
+            }
+        }
+
         std::cout << "  Saved tail.ppm (" << tail_rows.size() << " rows, gen "
-                  << tail_start << "-" << current_gen << ")\n";
+                  << tail_start << "-" << current_gen << ")";
+        if (has_right_view) std::cout << " + tail_r.ppm";
+        std::cout << "\n";
     }
+
+    double run_secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - run_t0).count();
 
     // Verification & summary
     std::ofstream sf(outdir + "/summary.txt");
@@ -618,6 +610,10 @@ int main(int argc, char* argv[]) {
     out("Settled: gen " + std::to_string(halt_gen));
     if (halt_gen > 0 && cts_steps > 0)
         out("  " + std::to_string((double)halt_gen / cts_steps) + " gens/CTS step");
+
+    char timing_buf[128];
+    snprintf(timing_buf, sizeof(timing_buf), "Compile: %.1fms, Run: %.1fs", compile_ms, run_secs);
+    out(std::string(timing_buf));
 
     bool pass = (halt_gen >= 0);
     out("\nChecks:");
