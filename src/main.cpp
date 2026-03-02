@@ -127,15 +127,32 @@ static TuringMachine build_tm(const TMTestCase& test) {
 struct MismatchEntry { long long generation; int mismatch; int active_width; };
 
 static int measure_active_width(const Rule110Runner::State& current, size_t start, size_t end) {
-    int first = -1, last = -1;
-    for (size_t i = start + 14; i + 14 < end; i++) {
-        if (get_bit(current, i) != get_bit(current, i - 14) ||
-            get_bit(current, i) != get_bit(current, i + 14)) {
-            if (first < 0) first = (int)(i - start);
-            last = (int)(i - start);
+    // Scan inward from left edge: find where ether ends (first period-14 break)
+    const int RUN = 42;  // require 3 full periods of agreement to call it ether
+    size_t len = end - start;
+    if (len < (size_t)(RUN + 28)) return (int)len;
+
+    // From left: find first position where period-14 breaks
+    int left_ether = 0;
+    for (size_t i = start + 14; i < end; i++) {
+        if (get_bit(current, i) != get_bit(current, i - 14)) {
+            left_ether = (int)(i - start);
+            break;
         }
     }
-    return (first >= 0) ? last - first : 0;
+    if (left_ether == 0) return 0;  // entire region is ether
+
+    // From right: find last position where period-14 breaks
+    int right_ether = 0;
+    for (size_t i = end - 15; i > start; i--) {
+        if (get_bit(current, i) != get_bit(current, i + 14)) {
+            right_ether = (int)(end - 1 - i);
+            break;
+        }
+    }
+
+    int active = (int)len - left_ether - right_ether;
+    return (active > 0) ? active : 0;
 }
 
 // --- Binary addition TM ---
@@ -538,17 +555,28 @@ int main(int argc, char* argv[]) {
             if (interrupted.load()) break;
 
             // Measure active width from buf_curr (populated by hl_settling_check)
+            // Scan inward from edges to find where ether ends
             int aw = 0;
             {
-                int first = -1, last = -1;
-                for (size_t i = 14; i + 14 < buf_curr.size(); i++) {
-                    if (buf_curr[i] != buf_curr[i - 14] ||
-                        buf_curr[i] != buf_curr[i + 14]) {
-                        if (first < 0) first = (int)i;
-                        last = (int)i;
+                size_t blen = buf_curr.size();
+                int left_ether = 0;
+                for (size_t i = 14; i < blen; i++) {
+                    if (buf_curr[i] != buf_curr[i - 14]) {
+                        left_ether = (int)i;
+                        break;
                     }
                 }
-                aw = (first >= 0) ? last - first : 0;
+                int right_ether = 0;
+                if (left_ether > 0) {
+                    for (size_t i = blen - 15; i > 0; i--) {
+                        if (buf_curr[i] != buf_curr[i + 14]) {
+                            right_ether = (int)(blen - 1 - i);
+                            break;
+                        }
+                    }
+                }
+                int active = (int)blen - left_ether - right_ether;
+                aw = (left_ether > 0 && active > 0) ? active : (left_ether == 0 ? 0 : (int)blen);
             }
 
             // Log-spaced mismatch sampling: only log when generation has

@@ -233,58 +233,90 @@ def plot_tm_trace(outdir: Path):
 
 
 def annotate_head_tail(outdir: Path):
-    """Annotate head and tail PPM images with generation scales and region labels."""
-    # Try PNG first (from convert_images.py), then PPM
-    for suffix, label in [('head', 'Head'), ('tail', 'Tail')]:
-        png_path = outdir / f"{suffix}_center.png"
-        ppm_path = outdir / f"{suffix}.ppm"
-        src_path = png_path if png_path.exists() else ppm_path
-        if not src_path.exists():
-            print(f"  No {suffix} image found, skipping")
+    """Annotate head and tail images as merged left+right panels.
+
+    Left panel shows the left-periodic → central boundary.
+    Right panel shows the central → right-periodic boundary.
+    Side by side = reading the tape left to right, with a gap for the
+    central region that's too wide to render.
+    If only one view exists, produces a single-panel image.
+    """
+    # Allow large images (head.ppm can be 250k x 4801)
+    Image.MAX_IMAGE_PIXELS = None
+
+    # Read settling gen once for tail gen ranges
+    settle_gen = None
+    summary_path = outdir / "summary.txt"
+    if summary_path.exists():
+        m = re.search(r'Settled: gen (\d+)', summary_path.read_text())
+        if m:
+            settle_gen = int(m.group(1))
+
+    def _find_image(suffix):
+        """Try PNG (from convert_images.py) then PPM."""
+        for name in [f"{suffix}_center.png", f"{suffix}.ppm"]:
+            p = outdir / name
+            if p.exists():
+                return p
+        return None
+
+    for phase in ['head', 'tail']:
+        left_path = _find_image(phase)
+        right_path = _find_image(f"{phase}_r")
+        if not left_path and not right_path:
+            print(f"  No {phase} image found, skipping")
             continue
 
-        img = Image.open(src_path)
-        w, h = img.size
-        print(f"  {src_path.name}: {w}x{h}")
-
         # Determine generation range
-        gen_start, gen_end = 0, h - 1
-        if suffix == 'head':
-            gen_start = 0
-            gen_end = h - 1
-        elif suffix == 'tail':
-            # Read summary.txt to find settling gen and tail start
-            summary_path = outdir / "summary.txt"
-            if summary_path.exists():
-                text = summary_path.read_text()
-                m = re.search(r'Settled: gen (\d+)', text)
-                if m:
-                    gen_end = int(m.group(1))
-                    gen_start = gen_end - h + 1
+        ref_path = left_path or right_path
+        ref_img = Image.open(ref_path)
+        h = ref_img.size[1]
+        ref_img.close()
+        if phase == 'head':
+            gen_start, gen_end = 0, h - 1
+        else:
+            gen_end = settle_gen if settle_gen else h - 1
+            gen_start = gen_end - h + 1
 
-        fig, ax = plt.subplots(figsize=(10, max(6, h / 200)))
-        ax.imshow(img, aspect='auto')
-        ax.set_xlabel('Cell position', fontsize=10)
+        has_both = left_path and right_path
+        ncols = 2 if has_both else 1
+        fig, axes = plt.subplots(1, ncols, figsize=(10 * ncols, max(6, h / 200)),
+                                 sharey=True, squeeze=False)
 
-        # Y axis with generation labels
-        n_ticks = min(10, h)
-        tick_positions = [int(i * (h - 1) / max(1, n_ticks - 1)) for i in range(n_ticks)]
-        tick_labels = [f'{gen_start + int(p * (gen_end - gen_start) / max(1, h - 1)):,}'
-                       for p in tick_positions]
-        ax.set_yticks(tick_positions)
-        ax.set_yticklabels(tick_labels, fontsize=8)
-        ax.set_ylabel('Generation', fontsize=10)
+        panels = []
+        if left_path:
+            panels.append((left_path, axes[0][0],
+                           'Left boundary', 'left periodic \u2192 central'))
+        if right_path:
+            col = 1 if has_both else 0
+            panels.append((right_path, axes[0][col],
+                           'Right boundary', 'central \u2192 right periodic'))
 
-        # Region labels at top
-        ax.text(0.15, 1.02, 'left periodic', ha='center', va='bottom',
-                transform=ax.transAxes, fontsize=8, color='gray', style='italic')
-        ax.text(0.5, 1.02, 'central', ha='center', va='bottom',
-                transform=ax.transAxes, fontsize=8, color='gray', style='italic')
-        ax.text(0.85, 1.02, 'right periodic', ha='center', va='bottom',
-                transform=ax.transAxes, fontsize=8, color='gray', style='italic')
+        for i, (src_path, ax, title, xlabel) in enumerate(panels):
+            img = Image.open(src_path)
+            w, h_img = img.size
+            print(f"  {src_path.name}: {w}x{h_img}")
 
-        ax.set_title(f'{label} spacetime', fontsize=12, pad=20)
-        fname = outdir / f"{suffix}_annotated.png"
+            ax.imshow(img, aspect='auto')
+            ax.set_xlabel(xlabel, fontsize=9)
+
+            # Y axis with generation labels (only on leftmost panel)
+            if i == 0:
+                n_ticks = min(10, h_img)
+                tick_pos = [int(j * (h_img - 1) / max(1, n_ticks - 1)) for j in range(n_ticks)]
+                tick_labels = [f'{gen_start + int(p * (gen_end - gen_start) / max(1, h_img - 1)):,}'
+                               for p in tick_pos]
+                ax.set_yticks(tick_pos)
+                ax.set_yticklabels(tick_labels, fontsize=8)
+                ax.set_ylabel('Generation', fontsize=10)
+
+            ax.set_title(title, fontsize=11, pad=5)
+
+        phase_label = 'Head' if phase == 'head' else 'Tail'
+        fig.suptitle(f'{phase_label} spacetime (gen {gen_start:,} \u2013 {gen_end:,})',
+                     fontsize=13, y=1.02)
+        fig.tight_layout()
+        fname = outdir / f"{phase}_annotated.png"
         fig.savefig(fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"  {fname.name}")
