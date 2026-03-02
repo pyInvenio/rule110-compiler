@@ -14,6 +14,7 @@
 #include <csignal>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 
 using namespace Rule110;
 
@@ -119,6 +120,71 @@ static TuringMachine build_tm(const TMTestCase& test) {
     tm.set_initial_state(test.initial_state);
     tm.set_tape(test.initial_tape, test.head_pos);
     return tm;
+}
+
+// --- Analytics data ---
+
+struct MismatchEntry { long long generation; int mismatch; };
+
+struct TMStepInfo {
+    int tm_step, state, head_pos, tag_step;
+    long long cts_step;
+    std::vector<int> tape;
+};
+
+static bool tapes_match(const std::vector<int>& a, const std::vector<int>& b) {
+    auto effective_len = [](const std::vector<int>& t) -> int {
+        for (int i = (int)t.size() - 1; i >= 0; i--)
+            if (t[i] != 0) return i + 1;
+        return 0;
+    };
+    int la = effective_len(a), lb = effective_len(b);
+    if (la != lb) return false;
+    for (int i = 0; i < la; i++)
+        if (a[i] != b[i]) return false;
+    return true;
+}
+
+static std::vector<TMStepInfo> analyze_tm_boundaries(
+        const TMTestCase& test, int phi_size, int s) {
+    // Record TM execution history
+    TuringMachine tm_a = build_tm(test);
+    struct Snap { int state; std::vector<int> tape; int head_pos; };
+    std::vector<Snap> tm_hist;
+    tm_hist.push_back({tm_a.get_current_state(), tm_a.get_tape(), tm_a.get_head_pos()});
+    while (tm_a.step())
+        tm_hist.push_back({tm_a.get_current_state(), tm_a.get_tape(), tm_a.get_head_pos()});
+
+    std::vector<TMStepInfo> boundaries;
+    boundaries.push_back({0, tm_hist[0].state, tm_hist[0].head_pos, 0, 0, tm_hist[0].tape});
+
+    // Run tag system, decode at each step to find TM step boundaries
+    TuringMachine tm_b = build_tm(test);
+    TagSystem ts_a = TMToTagConverter::convert(tm_b);
+
+    int next_tm = 1;
+    int tag_steps = 0;
+    while (ts_a.step()) {
+        tag_steps++;
+        auto word = ts_a.get_word();
+        if (word.empty()) break;
+
+        TMConfig cfg = Decoder::tag_to_tm(word, test.num_states, test.num_symbols);
+        if (!cfg.valid) continue;
+
+        for (int idx = next_tm; idx < (int)tm_hist.size(); idx++) {
+            if (cfg.state == tm_hist[idx].state &&
+                cfg.head_pos == tm_hist[idx].head_pos &&
+                tapes_match(cfg.tape, tm_hist[idx].tape)) {
+                long long cts_step = (long long)tag_steps * s * phi_size;
+                boundaries.push_back({idx, tm_hist[idx].state, tm_hist[idx].head_pos,
+                                      tag_steps, cts_step, tm_hist[idx].tape});
+                next_tm = idx + 1;
+                break;
+            }
+        }
+    }
+    return boundaries;
 }
 
 // --- Binary addition TM ---
@@ -345,7 +411,17 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT, signal_handler);
 
+    // Analytics data
+    std::vector<MismatchEntry> mismatch_log;
+    const size_t SPACETIME_CROP = 4000;
+    size_t spacetime_crop_start = center_start + central_width / 2 - SPACETIME_CROP / 2;
+    if (central_width < SPACETIME_CROP) spacetime_crop_start = center_start;
+    size_t spacetime_crop_width = std::min(SPACETIME_CROP, central_width);
+    std::vector<std::pair<long long, std::vector<uint8_t>>> spacetime_phase1;
+    const int SPACETIME_PHASE1_INTERVAL = 5;
+
     auto run_t0 = std::chrono::steady_clock::now();
+    double analytics_total_secs = 0;
     std::cout << "\nRunning (Ctrl+C to stop)...\n\n";
 
     // Phase 1: head image (brute-force, first HEAD_GENS generations)
@@ -373,6 +449,14 @@ int main(int argc, char* argv[]) {
             write_ppm_row_colored(head_r_ppm, row_buf_r, detector_r.color_map(), view_width_r);
         }
 
+        // Spacetime: save gen 0 center crop
+        {
+            std::vector<uint8_t> crop(spacetime_crop_width);
+            for (size_t i = 0; i < spacetime_crop_width; i++)
+                crop[i] = get_bit(*cur, spacetime_crop_start + i);
+            spacetime_phase1.push_back({0, std::move(crop)});
+        }
+
         for (long long g = 1; g <= HEAD_GENS && !interrupted.load(); g++) {
             Rule110Runner::next_generation(*cur, *nxt);
             std::swap(cur, nxt);
@@ -388,9 +472,18 @@ int main(int argc, char* argv[]) {
                 write_ppm_row_colored(head_r_ppm, row_buf_r, detector_r.color_map(), view_width_r);
             }
 
+            // Spacetime: save center crop at intervals
+            if (g % SPACETIME_PHASE1_INTERVAL == 0) {
+                std::vector<uint8_t> crop(spacetime_crop_width);
+                for (size_t i = 0; i < spacetime_crop_width; i++)
+                    crop[i] = get_bit(*cur, spacetime_crop_start + i);
+                spacetime_phase1.push_back({g, std::move(crop)});
+            }
+
             if (g % 30 == 0) {
                 int mm = count_unsettled(*cur, prev30, center_start, center_end);
                 prev30 = *cur;
+                mismatch_log.push_back({g, mm});
                 if (mm < 300) {
                     halt_gen = g;
                     std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
@@ -421,6 +514,8 @@ int main(int argc, char* argv[]) {
         HashLife1D hl;
         HashLife1D::Node* root = hl.from_bits(flat_tape, ether_pat);
         std::vector<int>().swap(flat_tape);
+        HashLife1D::Node* initial_root = root;
+        long long initial_hl_gen = current_gen;
 
         std::cout << "  HashLife: " << hl.node_count() << " nodes, "
                   << hl.canon_size() << " canonical\n";
@@ -456,6 +551,14 @@ int main(int argc, char* argv[]) {
             if (interrupted.load()) break;
             int mm = hl_settling_check(root, prev_check);
             if (interrupted.load()) break;
+
+            // Log-spaced mismatch sampling: only log when generation has
+            // grown by ~10% since last entry (matches log-scale X axis)
+            if (mismatch_log.empty() ||
+                search_gen >= (long long)(mismatch_log.back().generation * 1.1) ||
+                mm < 300) {
+                mismatch_log.push_back({search_gen, mm});
+            }
 
             if (mm < 300) {
                 halt_gen = search_gen;
@@ -500,6 +603,129 @@ int main(int argc, char* argv[]) {
             last_unsettled_root = base_root;
             last_unsettled_gen = lo;
             std::cout << "  Narrowed to [" << lo << ", " << hi << "]\n";
+        }
+
+        // === Analytics extraction (while HashLife tree is alive) ===
+        if (halt_gen >= 0 && !interrupted.load()) {
+            auto analytics_t0 = std::chrono::steady_clock::now();
+            int phi_size = (int)cts.get_appendants().size() / ts.get_deletion_number();
+            int s = test.num_symbols + 2;
+
+            // 1. Spacetime diagram: sample center crops at logarithmic intervals
+            {
+                // Compute sample points (logarithmic from initial_hl_gen to halt_gen)
+                const int NUM_PHASE2_SAMPLES = 1000;
+                std::vector<long long> sample_gens;
+                double log_start = std::log(std::max(1LL, initial_hl_gen));
+                double log_end = std::log((double)halt_gen);
+                for (int i = 0; i < NUM_PHASE2_SAMPLES; i++) {
+                    double frac = (double)i / (NUM_PHASE2_SAMPLES - 1);
+                    long long g = (long long)std::exp(log_start + frac * (log_end - log_start));
+                    g = (g / 30) * 30;  // align to period
+                    if (g <= initial_hl_gen) g = initial_hl_gen + 30;
+                    if (!sample_gens.empty() && g <= sample_gens.back()) continue;
+                    if (g >= halt_gen) break;
+                    sample_gens.push_back(g);
+                }
+
+                size_t total_rows = spacetime_phase1.size() + sample_gens.size();
+                std::ofstream st_ppm(outdir + "/spacetime.ppm", std::ios::binary);
+                st_ppm << "P6\n" << spacetime_crop_width << " " << total_rows << "\n255\n";
+                std::ofstream st_meta(outdir + "/spacetime_meta.csv");
+                st_meta << "row,generation\n";
+
+                // Write Phase 1 rows
+                int row_idx = 0;
+                for (size_t ri = 0; ri < spacetime_phase1.size(); ri++) {
+                    long long gen = spacetime_phase1[ri].first;
+                    auto& crop = spacetime_phase1[ri].second;
+                    for (size_t i = 0; i < spacetime_crop_width; i++) {
+                        uint8_t v = crop[i] ? 0 : 255;
+                        st_ppm.put(v); st_ppm.put(v); st_ppm.put(v);
+                    }
+                    st_meta << row_idx++ << "," << gen << "\n";
+                }
+
+                // Write Phase 2 rows (from HashLife)
+                std::vector<uint8_t> crop_buf;
+                for (auto g : sample_gens) {
+                    auto node = hl.advance(initial_root, g - initial_hl_gen);
+                    hl.extract_bits(node, spacetime_crop_start, spacetime_crop_width, crop_buf);
+                    for (size_t i = 0; i < spacetime_crop_width; i++) {
+                        uint8_t v = crop_buf[i] ? 0 : 255;
+                        st_ppm.put(v); st_ppm.put(v); st_ppm.put(v);
+                    }
+                    st_meta << row_idx++ << "," << g << "\n";
+                }
+                std::cout << "  Spacetime: " << total_rows << " rows ("
+                          << spacetime_phase1.size() << " head + "
+                          << sample_gens.size() << " hashlife)\n";
+            }
+            spacetime_phase1.clear();
+
+            // 2. TM step boundary R110 spacetime windows
+            {
+                auto tm_bounds = analyze_tm_boundaries(test, phi_size, s);
+                double gens_per_cts = (cts_steps > 0) ? (double)halt_gen / cts_steps : 0;
+                const int TM_WINDOW = 200;
+
+                std::ofstream tm_csv(outdir + "/tm_steps.csv");
+                tm_csv << "tm_step,tag_step,cts_step,r110_gen,window_start,window_rows,state,head_pos,tape\n";
+
+                for (auto& b : tm_bounds) {
+                    long long r110_gen = (long long)(b.cts_step * gens_per_cts);
+                    r110_gen = (r110_gen / 30) * 30;
+
+                    // Window centered on r110_gen, but no earlier than initial_hl_gen
+                    long long win_start = std::max(initial_hl_gen,
+                                                    r110_gen - TM_WINDOW / 2);
+                    // Don't go past settling
+                    if (win_start + TM_WINDOW > halt_gen)
+                        win_start = std::max(initial_hl_gen, halt_gen - TM_WINDOW);
+
+                    tm_csv << b.tm_step << "," << b.tag_step << "," << b.cts_step
+                           << "," << r110_gen << "," << win_start << "," << TM_WINDOW
+                           << "," << b.state << "," << b.head_pos
+                           << ",\"" << format_tape(b.tape) << "\"\n";
+
+                    // Advance HashLife to window start, convert to packed state
+                    auto win_root = hl.advance(initial_root, win_start - initial_hl_gen);
+                    auto win_state = hl.to_packed_state(win_root, tape_size);
+
+                    // Write multi-row spacetime PPM via direct simulation
+                    std::string fname = outdir + "/tm_step_" + std::to_string(b.tm_step) + ".ppm";
+                    std::ofstream crop_ppm(fname, std::ios::binary);
+                    crop_ppm << "P6\n" << spacetime_crop_width << " " << TM_WINDOW << "\n255\n";
+
+                    Rule110Runner::State win_buf(win_state.size());
+                    Rule110Runner::State* w_cur = &win_state;
+                    Rule110Runner::State* w_nxt = &win_buf;
+                    std::vector<uint8_t> crop_row(spacetime_crop_width);
+
+                    for (int row = 0; row < TM_WINDOW; row++) {
+                        for (size_t i = 0; i < spacetime_crop_width; i++)
+                            crop_row[i] = get_bit(*w_cur, spacetime_crop_start + i);
+                        for (size_t i = 0; i < spacetime_crop_width; i++) {
+                            uint8_t v = crop_row[i] ? 0 : 255;
+                            crop_ppm.put(v); crop_ppm.put(v); crop_ppm.put(v);
+                        }
+                        if (row + 1 < TM_WINDOW) {
+                            Rule110Runner::next_generation(*w_cur, *w_nxt);
+                            std::swap(w_cur, w_nxt);
+                        }
+                    }
+                    std::cout << "    step " << b.tm_step << ": gen "
+                              << win_start << "-" << (win_start + TM_WINDOW)
+                              << " (target " << r110_gen << ")\n";
+                }
+                std::cout << "  TM steps: " << tm_bounds.size() << " boundaries ("
+                          << TM_WINDOW << " gens each)\n";
+            }
+
+            double analytics_secs = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - analytics_t0).count();
+            analytics_total_secs += analytics_secs;
+            std::cout << "  Analytics: " << analytics_secs << "s\n";
         }
 
         auto flat_final = hl.to_packed_state(last_unsettled_root, tape_size);
@@ -547,6 +773,7 @@ int main(int argc, char* argv[]) {
             if (g % 30 == 0) {
                 int mm = count_unsettled(*cur, prev30, center_start, center_end);
                 prev30 = *cur;
+                mismatch_log.push_back({g, mm});
                 if (mm < 300) {
                     halt_gen = g;
                     std::cout << "  SETTLED gen " << g << " (mm=" << mm << ")\n";
@@ -602,6 +829,33 @@ int main(int argc, char* argv[]) {
     double run_secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - run_t0).count();
 
+    // Write mismatch CSV
+    {
+        std::ofstream mf(outdir + "/mismatch.csv");
+        mf << "generation,mismatch\n";
+        for (size_t i = 0; i < mismatch_log.size(); i++)
+            mf << mismatch_log[i].generation << "," << mismatch_log[i].mismatch << "\n";
+        std::cout << "  Saved mismatch.csv (" << mismatch_log.size() << " entries)\n";
+    }
+
+    // Write spacetime fallback (if Phase 2 was skipped)
+    if (!spacetime_phase1.empty()) {
+        std::ofstream st_ppm(outdir + "/spacetime.ppm", std::ios::binary);
+        st_ppm << "P6\n" << spacetime_crop_width << " " << spacetime_phase1.size() << "\n255\n";
+        std::ofstream st_meta(outdir + "/spacetime_meta.csv");
+        st_meta << "row,generation\n";
+        for (size_t ri = 0; ri < spacetime_phase1.size(); ri++) {
+            long long gen = spacetime_phase1[ri].first;
+            auto& crop = spacetime_phase1[ri].second;
+            for (size_t i = 0; i < spacetime_crop_width; i++) {
+                uint8_t v = crop[i] ? 0 : 255;
+                st_ppm.put(v); st_ppm.put(v); st_ppm.put(v);
+            }
+            st_meta << ri << "," << gen << "\n";
+        }
+        std::cout << "  Saved spacetime.ppm (fallback, " << spacetime_phase1.size() << " rows)\n";
+    }
+
     // Verification & summary
     std::ofstream sf(outdir + "/summary.txt");
     auto out = [&](const std::string& s) { std::cout << s << "\n"; sf << s << "\n"; };
@@ -616,8 +870,10 @@ int main(int argc, char* argv[]) {
     if (halt_gen > 0 && cts_steps > 0)
         out("  " + std::to_string((double)halt_gen / cts_steps) + " gens/CTS step");
 
-    char timing_buf[128];
-    snprintf(timing_buf, sizeof(timing_buf), "Compile: %.1fms, Run: %.1fs", compile_ms, run_secs);
+    char timing_buf[256];
+    double sim_secs = run_secs - analytics_total_secs;
+    snprintf(timing_buf, sizeof(timing_buf), "Compile: %.1fms, Run: %.1fs (+ %.1fs analytics)",
+             compile_ms, sim_secs, analytics_total_secs);
     out(std::string(timing_buf));
 
     bool pass = (halt_gen >= 0);
@@ -649,6 +905,8 @@ int main(int argc, char* argv[]) {
         }() + "  (computed through Rule 110)");
     }
 
-    std::cout << "\n  uv run --with Pillow python3 tools/convert_images.py " << outdir << "\n";
+    std::cout << "\nVisualize:\n"
+              << "  uv run --with Pillow python3 tools/convert_images.py " << outdir << "\n"
+              << "  uv run --with matplotlib --with Pillow python3 tools/create_analytics.py " << outdir << "\n";
     return 0;
 }
