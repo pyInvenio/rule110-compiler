@@ -266,14 +266,14 @@ int main(int argc, char* argv[]) {
     if (is_addition)
         show_addition_result(test.name, tm_check.get_tape());
 
+    std::string outdir = "output/" + sanitize(test.name);
+    mkdir("output", 0755);
+    mkdir(outdir.c_str(), 0755);
+
     // Write TM execution trace to tm_steps.csv
     {
-        std::string trace_dir = "output/" + sanitize(test.name);
-        mkdir("output", 0755);
-        mkdir(trace_dir.c_str(), 0755);
-
         TuringMachine tm_trace = build_tm(test);
-        std::ofstream tm_csv(trace_dir + "/tm_steps.csv");
+        std::ofstream tm_csv(outdir + "/tm_steps.csv");
         tm_csv << "tm_step,state,head_pos,tape\n";
         tm_csv << 0 << "," << tm_trace.get_current_state() << ","
                << tm_trace.get_head_pos() << ",\""
@@ -289,11 +289,43 @@ int main(int argc, char* argv[]) {
     }
 
     TagSystem ts = TMToTagConverter::convert(tm);
+
+    // Tag system trace
+    {
+        TagSystem ts_trace = ts;
+        std::ofstream tag_csv(outdir + "/tag_trace.csv");
+        tag_csv << "step,word_length\n";
+        tag_csv << 0 << "," << ts_trace.word_length() << "\n";
+        int tag_step = 0;
+        while (ts_trace.step()) {
+            tag_step++;
+            tag_csv << tag_step << "," << ts_trace.word_length() << "\n";
+        }
+        std::cout << "  Saved tag_trace.csv (" << tag_step << " steps)\n";
+    }
+
     CyclicTagSystem cts = TagToCyclicConverter::convert(ts);
 
-    CyclicTagSystem cts_check = cts;
+    int phi_size = (int)cts.get_appendants().size() / ts.get_deletion_number();
+
     int cts_steps = 0;
-    while (cts_check.step()) cts_steps++;
+    {
+        CyclicTagSystem cts_check = cts;
+        std::ofstream cts_csv(outdir + "/cts_trace.csv");
+        cts_csv << "step,tape_length\n";
+        cts_csv << 0 << "," << cts_check.tape_length() << "\n";
+        int sample_every = 1;
+        while (cts_check.step()) {
+            cts_steps++;
+            if (cts_steps == 100000 && sample_every == 1)
+                sample_every = 10;
+            if (cts_steps % sample_every == 0)
+                cts_csv << cts_steps << "," << cts_check.tape_length() << "\n";
+        }
+        if (cts_steps % sample_every != 0)
+            cts_csv << cts_steps << "," << cts_check.tape_length() << "\n";
+        std::cout << "  Saved cts_trace.csv (" << cts_steps << " steps)\n";
+    }
     std::cout << "CTS: " << cts.get_appendants().size() << " appendants, "
               << cts.tape_length() << " tape, halts in " << cts_steps << " steps\n";
 
@@ -323,7 +355,6 @@ int main(int argc, char* argv[]) {
             i = j;
         }
 
-        int phi_size = (int)cts.get_appendants().size() / ts.get_deletion_number();
         auto tag_word = Decoder::cts_to_tag(decoded_cts, phi_size);
         if (!tag_word.empty()) {
             TMConfig cfg = Decoder::tag_to_tm(tag_word, test.num_states, test.num_symbols);
@@ -343,8 +374,7 @@ int main(int argc, char* argv[]) {
 
                 // Write decode.csv
                 {
-                    std::string decode_dir = "output/" + sanitize(test.name);
-                    std::ofstream df(decode_dir + "/decode.csv");
+                    std::ofstream df(outdir + "/decode.csv");
                     df << "point,state,head_pos,tape,match\n";
                     df << "initial," << cfg.state << "," << cfg.head_pos
                        << ",\"" << format_tape(cfg.tape) << "\","
@@ -388,9 +418,70 @@ int main(int argc, char* argv[]) {
         std::cout << " (2 views: " << view_width << " + " << view_width_r << ")";
     std::cout << "\n";
 
-    std::string outdir = "output/" + sanitize(test.name);
-    mkdir("output", 0755);
-    mkdir(outdir.c_str(), 0755);
+    // Write pipeline.json
+    {
+        std::ofstream pj(outdir + "/pipeline.json");
+        pj << "{\n";
+
+        // TM section
+        pj << "  \"tm\": {\n";
+        pj << "    \"name\": \"" << test.name << "\",\n";
+        pj << "    \"num_states\": " << test.num_states << ",\n";
+        pj << "    \"num_symbols\": " << test.num_symbols << ",\n";
+        pj << "    \"initial_tape\": " << format_tape(test.initial_tape) << ",\n";
+        pj << "    \"final_tape\": " << format_tape(tm_check.get_tape()) << ",\n";
+        pj << "    \"initial_state\": " << test.initial_state << ",\n";
+        pj << "    \"head_pos\": " << test.head_pos << ",\n";
+        pj << "    \"steps\": " << tm_steps << ",\n";
+        pj << "    \"transitions\": [";
+        for (size_t i = 0; i < test.transitions.size(); i++) {
+            auto& tr = test.transitions[i];
+            const char* dir = (tr.move == Move::LEFT ? "L" :
+                               (tr.move == Move::RIGHT ? "R" : "H"));
+            pj << (i ? "," : "") << "[" << tr.state << "," << tr.symbol << ","
+               << tr.next_state << "," << tr.write_symbol << ",\"" << dir << "\"]";
+        }
+        pj << "]\n";
+        pj << "  },\n";
+
+        // Tag section
+        int tag_alphabet_size = 0;
+        for (const auto& kv : ts.get_rules()) {
+            tag_alphabet_size = std::max(tag_alphabet_size, kv.first + 1);
+            for (int v : kv.second)
+                tag_alphabet_size = std::max(tag_alphabet_size, v + 1);
+        }
+        auto tag_init_word = ts.get_word();
+
+        pj << "  \"tag\": {\n";
+        pj << "    \"deletion_number\": " << ts.get_deletion_number() << ",\n";
+        pj << "    \"alphabet_size\": " << tag_alphabet_size << ",\n";
+        pj << "    \"initial_word_length\": " << ts.word_length() << ",\n";
+        pj << "    \"initial_word\": " << format_tape(tag_init_word) << "\n";
+        pj << "  },\n";
+
+        // CTS section
+        pj << "  \"cts\": {\n";
+        pj << "    \"phi_size\": " << phi_size << ",\n";
+        pj << "    \"num_appendants\": " << cts.get_appendants().size() << ",\n";
+        pj << "    \"initial_tape_length\": " << cts.tape_length() << ",\n";
+        pj << "    \"steps\": " << cts_steps << "\n";
+        pj << "  },\n";
+
+        // R110 section
+        pj << "  \"r110\": {\n";
+        pj << "    \"left_periodic_size\": " << r110.left_periodic.size() << ",\n";
+        pj << "    \"central_bits\": " << r110.central_part.size() << ",\n";
+        pj << "    \"right_periodic_size\": " << r110.right_periodic.size() << ",\n";
+        pj << "    \"total_bits\": " << tape_size_total << ",\n";
+        pj << "    \"center_start\": " << center_start << ",\n";
+        pj << "    \"view_start\": " << view_start << ",\n";
+        pj << "    \"view_width\": " << view_width << "\n";
+        pj << "  }\n";
+
+        pj << "}\n";
+        std::cout << "  Saved pipeline.json\n";
+    }
 
     Rule110Runner::State state = Rule110Runner::pack(tape_int);
     std::vector<int>().swap(tape_int);
